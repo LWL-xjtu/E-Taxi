@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comet-taxi"
+version = "0.1.0"
+description = "COMET small-sample MARL experiment for dynamic E-taxi dispatch."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "OpenAI Codex" }
+]
+dependencies = [
+  "matplotlib>=3.7",
+  "numpy>=1.25",
+  "pandas>=2.0",
+  "pyarrow>=14.0",
+  "torch>=2.1",
+  "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+prepare_nyc = "comet_taxi.cli:prepare_nyc_main"
+train = "comet_taxi.cli:train_main"
+evaluate = "comet_taxi.cli:evaluate_main"
+run_greedy_baseline = "comet_taxi.cli:run_greedy_baseline_main"
+visualize_results = "comet_taxi.visualize:visualize_results_main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+pytest-cache-files-*/
+outputs/
+data/
+*.pt
+*.png
+*.csv
+*.parquet

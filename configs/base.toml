@@ -1,0 +1,65 @@
+[data]
+grid_rows = 8
+grid_cols = 8
+step_minutes = 10
+start_hour = 8
+end_hour = 20
+use_first_n_days = 7
+train_days = 5
+val_days = 1
+test_days = 1
+
+[env]
+nmax = 64
+min_active_agents = 24
+max_active_agents = 64
+charge_station_count = 5
+battery_low_threshold = 0.25
+battery_mid_threshold = 0.60
+charge_rate_per_step = 0.18
+move_consumption = 0.03
+service_consumption = 0.02
+idle_consumption = 0.005
+low_battery_penalty_weight = 0.35
+empty_move_penalty = 0.08
+idle_penalty = 0.02
+default_charge_price = 1.0
+
+[model]
+zone_embedding_dim = 16
+hidden_dim = 128
+fleet_hidden_dim = 128
+dropout = 0.1
+aux_hidden_dim = 64
+
+[train]
+seed = 7
+device = "auto"
+total_episodes = 60
+ppo_epochs = 4
+minibatch_size = 16
+gamma = 0.99
+gae_lambda = 0.95
+ppo_clip = 0.2
+entropy_coef = 0.01
+value_coef = 0.5
+aux_coef = 0.2
+learning_rate = 0.0003
+weight_decay = 0.00001
+max_grad_norm = 0.8
+eval_interval = 10
+save_interval = 10
+
+[domain_randomization]
+enabled = true
+demand_scale_min = 0.85
+demand_scale_max = 1.15
+travel_time_noise_min = 0.90
+travel_time_noise_max = 1.15
+charge_price_scale_min = 0.90
+charge_price_scale_max = 1.20
+
+[reward]
+profit_weight = 1.0
+efficiency_weight = 1.0
+battery_weight = 1.0
