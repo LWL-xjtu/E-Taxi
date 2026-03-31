@@ -1,141 +1,241 @@
-# COMET Taxi
+# COMET-v2 Taxi
 
-COMET Taxi is a small-sample research prototype for dynamic-agent E-taxi dispatch and charging. It implements the COMET idea from the planning document:
+COMET-v2 is a runnable multi-agent electric taxi dispatch prototype built on the NYC TLC yellow taxi public dataset and a lightweight simulator. Compared with the original COMET prototype in this repo, the default path now adds:
 
-- fixed-size multi-agent observations with `Ghost + Mask`
-- parameter-shared actor and centralized masked critic
-- MAPPO training with mean team reward
-- NYC TLC small-sample preprocessing and a grid-world simulator
-- pure-RL improvements only: auxiliary demand prediction, domain randomization, and slot shuffling
+- permutation-invariant fleet encoding
+- temporal memory over recent demand / charger / delay history
+- offline pretraining plus offline-to-online mixing
+- explicit safety costs with Lagrange multipliers
+- planner-based runtime with uncertainty gate and greedy fallback
+- robustness / stress evaluation and richer dashboards
 
-## Environment
+The code still keeps a legacy path. Set `[model] variant = "legacy"` in a config if you want the old shared-actor + simple centralized critic flow.
 
-This repository now includes a local virtual environment at [`.venv`](D:/Codex%20Project/.venv).
+## What Is In The Repo
 
-Activate it in PowerShell:
+- `src/comet_taxi/data.py`: TLC preprocessing, calibration metadata, offline transition export, normalization stats helpers
+- `src/comet_taxi/env.py`: simulator with dynamic agents, ghost masking, history buffers, charger capacity / queue, explicit costs, candidate generation hooks
+- `src/comet_taxi/models.py`: legacy models plus COMET-v2 encoders, actor, critic ensemble, cost critics, observation normalization
+- `src/comet_taxi/planner.py`: candidate planner, uncertainty gate, greedy fallback
+- `src/comet_taxi/trainer.py`: offline pretrain, mixed replay, online PPO-style finetune, multiplier updates, checkpointing
+- `src/comet_taxi/evaluation.py`: standard evaluation and OOD stress suite
+- `src/comet_taxi/visualize.py`: training / robustness / constraint / fallback dashboards
+- `configs/`: runnable base, smoke, v2, and stress configs
+- `tests/`: CPU-safe unit and smoke tests
+
+## Installation
+
+### Local / Windows PowerShell
 
 ```powershell
+py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements-dev.txt
+python -m pip install -e .
 ```
 
-## GPU Note
-
-The default train device is `auto`, so the code will use `CUDA` automatically when available. On your A100 server, you should be able to keep the config unchanged and train on GPU directly.
-
-The Windows environment created here installed the default `torch` wheel. If your A100 server needs a CUDA-specific PyTorch wheel, reinstall `torch` inside the server venv before training, for example:
+### Linux / A100 Server
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install --index-url https://download.pytorch.org/whl/cu121 torch
+pip install -r requirements-dev.txt
+pip install -e .
 ```
 
-## Install
-
-Dependencies are already installed in the local `.venv`. For a fresh machine:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-```
+`device = "auto"` is the default in all configs, so COMET-v2 will use CUDA automatically when it is available.
 
 ## Data Preparation
 
-The preprocessing entrypoint expects a NYC TLC Yellow Taxi parquet file. The README example uses `yellow_tripdata_2023-01.parquet`.
+Download a TLC monthly parquet such as `yellow_tripdata_2023-01.parquet` and run:
 
-```powershell
-prepare_nyc --config configs/base.toml --input path\to\yellow_tripdata_2023-01.parquet --output data\processed\nyc_small
+```bash
+prepare_nyc --config configs/comet_v2.toml --input data/raw/yellow_tripdata_2023-01.parquet --output data/processed/nyc_small
 ```
 
-What preprocessing does:
+The preprocessor keeps the first 7 days, uses an `8x8` grid, bins trips into `10`-minute intervals, and writes:
 
-- takes the first 7 days
-- uses the 08:00-20:00 window with 10-minute bins
-- builds a fixed `8x8` grid
-- writes `train.parquet`, `val.parquet`, `test.parquet`, and `metadata.json`
+- `train.parquet`
+- `val.parquet`
+- `test.parquet`
+- `metadata.json`
 
-The code supports two input variants:
+`metadata.json` now includes:
 
-- coordinate columns (`pickup_longitude`, `pickup_latitude`, ...)
-- modern TLC `PULocationID` / `DOLocationID`, projected deterministically onto the fixed grid
+- demand priors and charge station placement
+- OD travel-time summaries
+- demand-per-zone-time summaries
+- charge-price summary
+- charger metadata placeholders for future station upgrades
 
-## Train
+## COMET-v2 Training Flow
 
-```powershell
-train --config configs/base.toml --data-dir data\processed\nyc_small --output-dir outputs\comet_run
+### Stage 1: Offline Pretrain
+
+The trainer exports a simulator-generated offline dataset if one does not already exist in the output directory.
+
+Important limitation:
+
+- this offline dataset is generated by the simulator with a behavior policy, not from real logged fleet actions
+- it is intended as a warm-start dataset for the prototype, not as a production offline RL corpus
+
+Default algorithm: `iql`-style weighted imitation + value fitting.
+
+Config section:
+
+- `[offline_rl]`
+
+### Stage 2: Offline-To-Online Transition
+
+During online training, the trainer mixes:
+
+- offline replay
+- online replay from fresh simulator rollouts
+
+The mixing ratio starts high and decays according to `[online_finetune]`.
+
+Logged metrics include:
+
+- `offline_ratio`
+- `online_ratio`
+
+### Stage 3: Online Multi-Agent Finetune
+
+The online update keeps PPO / MAPPO-style cooperative learning, but now uses:
+
+- COMET-v2 actor
+- critic ensemble
+- temporal features
+- explicit cost returns
+- constraint multipliers for battery / charger / service violations
+
+## Runtime Decision Flow
+
+The default runtime is no longer pure policy sampling. It now uses:
+
+1. candidate generation
+2. actor prior logits
+3. critic / cost-aware scoring
+4. uncertainty gate
+5. greedy fallback when risk is high
+
+Fallback and uncertainty rates are logged during training and evaluation.
+
+To force pure policy mode, set:
+
+```toml
+[planner]
+planner_mode = "policy"
 ```
 
-Outputs:
+## Main Commands
 
-- `metrics.csv`
-- `reward_curve.csv`
-- `reward_curve.png`
-- `checkpoints\episode_XXXX.pt`
-- `config_snapshot.json`
+### Smoke Test Training
 
-## Evaluate
+This is the quickest end-to-end run:
 
-```powershell
-evaluate --config configs/base.toml --data-dir data\processed\nyc_small --checkpoint outputs\comet_run\checkpoints\episode_0060.pt --output-dir outputs\eval_test --split test --episodes 1
+```bash
+prepare_nyc --config configs/smoke.toml --input data/raw/yellow_tripdata_2023-01.parquet --output data/processed/smoke
+train --config configs/smoke.toml --data-dir data/processed/smoke --output-dir outputs/smoke_run
 ```
 
-## Greedy Baseline
+### Full COMET-v2 Training
 
-```powershell
-run_greedy_baseline --config configs/base.toml --data-dir data\processed\nyc_small --output-dir outputs\greedy_test --split test --episodes 1
+```bash
+prepare_nyc --config configs/comet_v2.toml --input data/raw/yellow_tripdata_2023-01.parquet --output data/processed/nyc_small
+train --config configs/comet_v2.toml --data-dir data/processed/nyc_small --output-dir outputs/comet_v2_run
 ```
 
-## Visualization
+### Legacy Training
 
-Training outputs currently contain:
+Copy a config and change:
 
-- `metrics.csv`: per-episode training metrics and PPO losses
-- `reward_curve.csv`: training reward history
-- `reward_curve.png`: a basic reward plot
-- `checkpoints\episode_XXXX.pt`: saved actor/critic checkpoints
-- `config_snapshot.json`: config used for the run
-
-Evaluation outputs currently contain:
-
-- `metrics.csv`: aggregated evaluation metrics
-- `episode_summaries.csv`: per-episode metrics
-
-Main visualizable metrics:
-
-- `mean_team_reward`
-- `order_completion_rate`
-- `average_profit_per_vehicle`
-- `empty_travel_ratio`
-- `battery_safety_rate`
-- `charging_efficiency`
-- `actor_loss`
-- `value_loss`
-- `entropy`
-- `aux_loss`
-
-Generate dashboards:
-
-```powershell
-visualize_results --train-dir outputs\comet_run --eval-dirs outputs\eval_test outputs\greedy_test --labels COMET Greedy --output-dir outputs\viz
+```toml
+[model]
+variant = "legacy"
 ```
 
-This writes:
+Then run the same `train` command.
+
+### Standard Evaluation
+
+```bash
+evaluate --config configs/comet_v2.toml --data-dir data/processed/nyc_small --checkpoint outputs/comet_v2_run/checkpoints/episode_0060.pt --output-dir outputs/eval_standard --split test --episodes 1
+```
+
+### Stress Evaluation
+
+```bash
+evaluate --config configs/stress_eval.toml --data-dir data/processed/nyc_small --checkpoint outputs/comet_v2_run/checkpoints/episode_0060.pt --output-dir outputs/eval_stress --split test --episodes 1 --stress
+```
+
+### Greedy Baseline
+
+```bash
+run_greedy_baseline --config configs/stress_eval.toml --data-dir data/processed/nyc_small --output-dir outputs/greedy_stress --split test --episodes 1 --stress
+```
+
+### Visualization
+
+```bash
+visualize_results --train-dir outputs/comet_v2_run --eval-dirs outputs/eval_standard outputs/eval_stress outputs/greedy_stress --labels COMET-v2 Stress Greedy --output-dir outputs/viz
+```
+
+Outputs include:
 
 - `training_dashboard.png`
 - `loss_dashboard.png`
-- `validation_dashboard.png` when eval columns exist in training metrics
+- `validation_dashboard.png`
 - `comparison_dashboard.png`
+- `robustness_dashboard.png`
+- `constraint_dashboard.png`
+- `fallback_dashboard.png`
 - `comparison_metrics.csv`
-- one `*_episode_dashboard.png` per evaluation directory that has `episode_summaries.csv`
+
+## Metrics
+
+Training and evaluation write `metrics.csv` with at least:
+
+- reward and business metrics
+- `battery_violation_rate`
+- `charger_overflow_rate`
+- `service_violation_rate`
+- `lambda_battery`
+- `lambda_charger`
+- `lambda_service`
+- `fallback_rate`
+- `uncertainty_trigger_rate`
+- `offline_ratio`
+- `online_ratio`
 
 ## Tests
 
-Run tests without bytecode writes:
+Run all tests on CPU:
 
-```powershell
-.\.venv\Scripts\python.exe -B -m pytest
+```bash
+python -B -m pytest -q -p no:cacheprovider
 ```
 
-## Project Layout
+The smoke tests cover:
 
-- [`src/comet_taxi`](D:/Codex%20Project/src/comet_taxi): package code
-- [`configs`](D:/Codex%20Project/configs): experiment configs
-- [`tests`](D:/Codex%20Project/tests): preprocessing, env, model, and smoke training tests
+- model shapes and permutation invariance
+- env reset/step/history/cost outputs
+- planner candidate generation and fallback path
+- offline pretrain + online finetune smoke run
+- stress evaluation output columns
+- visualization assets
+
+## Design Notes And Known Simplifications
+
+This repo now implements a minimum runnable COMET-v2 system, but a few pieces are still intentionally lightweight:
+
+- the set-transformer option is a minimal native PyTorch variant, not a full research implementation
+- offline pretraining is simulator-generated and meant as warm-start data
+- planner scoring is deliberately simple and extensible rather than a full MPC stack
+- charger stations are still zone-level approximations rather than real station graphs
+- cost constraints use a lightweight multiplier update instead of a more elaborate PID controller implementation
+
+Those simplifications are documented in code and are intended extension points, not empty placeholders.

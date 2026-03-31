@@ -40,6 +40,17 @@ EVAL_METRICS = [
     ("charging_efficiency", "Charging Efficiency"),
 ]
 
+CONSTRAINT_METRICS = [
+    ("battery_violation_rate", "Battery Violation Rate"),
+    ("charger_overflow_rate", "Charger Overflow Rate"),
+    ("service_violation_rate", "Service Violation Rate"),
+]
+
+FALLBACK_METRICS = [
+    ("fallback_rate", "Fallback Rate"),
+    ("uncertainty_trigger_rate", "Uncertainty Trigger Rate"),
+]
+
 
 def _load_csv(path: str | Path) -> pd.DataFrame:
     return pd.read_csv(path)
@@ -121,25 +132,68 @@ def build_eval_comparison(
     resolved_labels = labels or [Path(path).name for path in eval_dirs]
     records: list[dict[str, float | str]] = []
     for label, eval_dir in zip(resolved_labels, eval_dirs):
-        metrics = _load_csv(Path(eval_dir) / "metrics.csv").iloc[0].to_dict()
-        record = {"label": label}
-        for metric, _ in EVAL_METRICS:
-            record[metric] = float(metrics.get(metric, 0.0))
-        records.append(record)
+        metrics_frame = _load_csv(Path(eval_dir) / "metrics.csv")
+        for _, row in metrics_frame.iterrows():
+            record = {"label": label, "scenario": row.get("scenario", "standard_test")}
+            for metric, _ in EVAL_METRICS + CONSTRAINT_METRICS + FALLBACK_METRICS:
+                record[metric] = float(row.get(metric, 0.0))
+            records.append(record)
 
     comparison = pd.DataFrame(records)
     comparison.to_csv(output_root / "comparison_metrics.csv", index=False)
 
     fig, axes = plt.subplots(2, 3, figsize=(16, 8))
     for axis, (metric, title) in zip(axes.flatten(), EVAL_METRICS):
-        axis.bar(comparison["label"], comparison[metric])
+        standard = comparison[comparison["scenario"] == "standard_test"]
+        axis.bar(standard["label"], standard[metric])
         axis.set_title(title)
         axis.tick_params(axis="x", rotation=20)
         axis.grid(alpha=0.2, axis="y")
     fig.tight_layout()
     fig.savefig(output_root / "comparison_dashboard.png")
     plt.close(fig)
+
+    if "scenario" in comparison.columns:
+        robustness = comparison.pivot_table(
+            index="scenario",
+            columns="label",
+            values="mean_team_reward",
+            aggfunc="mean",
+        )
+        robustness.plot(kind="bar", figsize=(12, 5))
+        plt.ylabel("Mean Team Reward")
+        plt.tight_layout()
+        plt.savefig(output_root / "robustness_dashboard.png")
+        plt.close()
     return comparison
+
+
+def plot_constraint_dashboard(comparison: pd.DataFrame, output_dir: str | Path) -> None:
+    output_root = ensure_dir(output_dir)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    for axis, (metric, title) in zip(axes, CONSTRAINT_METRICS):
+        if metric in comparison.columns:
+            axis.bar(comparison["label"], comparison[metric])
+        axis.set_title(title)
+        axis.tick_params(axis="x", rotation=20)
+        axis.grid(alpha=0.2, axis="y")
+    fig.tight_layout()
+    fig.savefig(output_root / "constraint_dashboard.png")
+    plt.close(fig)
+
+
+def plot_fallback_dashboard(comparison: pd.DataFrame, output_dir: str | Path) -> None:
+    output_root = ensure_dir(output_dir)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    for axis, (metric, title) in zip(axes, FALLBACK_METRICS):
+        if metric in comparison.columns:
+            axis.bar(comparison["label"], comparison[metric])
+        axis.set_title(title)
+        axis.tick_params(axis="x", rotation=20)
+        axis.grid(alpha=0.2, axis="y")
+    fig.tight_layout()
+    fig.savefig(output_root / "fallback_dashboard.png")
+    plt.close(fig)
 
 
 def visualize_results_main() -> None:
@@ -170,7 +224,9 @@ def visualize_results_main() -> None:
     if args.eval_dirs:
         if args.labels and len(args.labels) != len(args.eval_dirs):
             raise ValueError("If --labels is provided, it must match the number of --eval-dirs.")
-        build_eval_comparison(args.eval_dirs, args.labels, output_root)
+        comparison = build_eval_comparison(args.eval_dirs, args.labels, output_root)
+        plot_constraint_dashboard(comparison, output_root)
+        plot_fallback_dashboard(comparison, output_root)
         for index, eval_dir in enumerate(args.eval_dirs):
             eval_path = Path(eval_dir)
             summary_path = eval_path / "episode_summaries.csv"

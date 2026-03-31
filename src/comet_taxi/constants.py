@@ -30,5 +30,18 @@ MODE_SERVING = 1
 MODE_CHARGING = 2
 MODE_REPOSITIONING = 3
 
+MODE_COUNT = len(MODES)
 LOCAL_OBS_DIM = 10
 ACTION_DIM = len(ACTIONS)
+
+COST_NAMES = (
+    "battery_violation_cost",
+    "charger_overflow_cost",
+    "service_violation_cost",
+)
+
+AUXILIARY_TARGETS = (
+    "next_demand",
+    "charger_occupancy",
+    "travel_time_residual",
+)

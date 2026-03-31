@@ -1,9 +1,11 @@
 .venv/
+venv/
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 *.egg-info/
+.mypy_cache/
 .pytest_cache/
 pytest-cache-files-*/
 outputs/
@@ -12,3 +14,8 @@ data/
 *.png
 *.csv
 *.parquet
+*.npz
+checkpoints/
+wandb/
+key
+key.pub

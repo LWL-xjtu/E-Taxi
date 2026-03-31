@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pandas as pd
+
 from comet_taxi.config import load_experiment_config
 from comet_taxi.data import prepare_nyc_dataset
 from comet_taxi.synthetic import write_synthetic_parquet
@@ -30,3 +32,17 @@ def test_smoke_training_produces_outputs(tmp_path: Path) -> None:
     assert (output_dir / "reward_curve.csv").exists()
     checkpoints = list((output_dir / "checkpoints").glob("*.pt"))
     assert checkpoints
+    metrics = pd.read_csv(output_dir / "metrics.csv")
+    for column in (
+        "train_battery_violation_rate",
+        "train_charger_overflow_rate",
+        "train_service_violation_rate",
+        "lambda_battery",
+        "lambda_charger",
+        "lambda_service",
+        "train_fallback_rate",
+        "train_uncertainty_trigger_rate",
+        "offline_ratio",
+        "online_ratio",
+    ):
+        assert column in metrics.columns

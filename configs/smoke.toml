@@ -14,6 +14,8 @@ nmax = 32
 min_active_agents = 8
 max_active_agents = 16
 charge_station_count = 4
+charger_capacity = 2
+max_queue_length = 4
 battery_low_threshold = 0.25
 battery_mid_threshold = 0.60
 charge_rate_per_step = 0.20
@@ -23,19 +25,39 @@ idle_consumption = 0.005
 low_battery_penalty_weight = 0.35
 empty_move_penalty = 0.08
 idle_penalty = 0.02
+service_violation_penalty = 0.05
 default_charge_price = 1.0
 
 [model]
+variant = "v2"
 zone_embedding_dim = 12
 hidden_dim = 64
 fleet_hidden_dim = 64
 dropout = 0.0
 aux_hidden_dim = 32
+critic_ensemble_size = 2
+vehicle_token_dim = 64
+use_layer_norm = true
+
+[set_encoder]
+type = "deepsets"
+hidden_dim = 64
+num_heads = 2
+num_inducing_points = 4
+pooling = "mean"
+use_fleet_signature_skip = true
+
+[temporal]
+history_len = 4
+encoder_type = "gru"
+hidden_dim = 48
+num_layers = 1
 
 [train]
 seed = 3
 device = "auto"
 total_episodes = 3
+rollout_episodes_per_update = 1
 ppo_epochs = 2
 minibatch_size = 4
 gamma = 0.99
@@ -44,6 +66,7 @@ ppo_clip = 0.2
 entropy_coef = 0.01
 value_coef = 0.5
 aux_coef = 0.1
+cost_value_coef = 0.2
 learning_rate = 0.0005
 weight_decay = 0.0
 max_grad_norm = 0.8
@@ -58,8 +81,63 @@ travel_time_noise_min = 0.95
 travel_time_noise_max = 1.10
 charge_price_scale_min = 0.95
 charge_price_scale_max = 1.10
+charger_capacity_scale_min = 0.80
+charger_capacity_scale_max = 1.00
+peak_shock_probability = 0.10
+peak_shock_scale_min = 1.05
+peak_shock_scale_max = 1.20
+event_day_probability = 0.05
+event_day_scale_min = 1.05
+event_day_scale_max = 1.20
+apply_to_eval = false
 
 [reward]
 profit_weight = 1.0
 efficiency_weight = 1.0
 battery_weight = 1.0
+
+[offline_rl]
+enabled = true
+algorithm = "iql"
+dataset_episodes = 3
+pretrain_epochs = 1
+batch_size = 8
+expectile = 0.7
+temperature = 1.5
+cql_alpha = 0.05
+awac_lambda = 1.0
+
+[online_finetune]
+offline_ratio_start = 0.6
+offline_ratio_end = 0.2
+offline_ratio_decay_steps = 10
+planner_enabled = true
+uncertainty_threshold = 0.3
+online_replay_capacity = 256
+
+[safety]
+battery_limit = 0.08
+charger_limit = 0.15
+service_limit = 0.30
+multiplier_init = 0.1
+multiplier_lr = 0.05
+pid_kp = 1.0
+pid_ki = 0.1
+pid_kd = 0.0
+
+[planner]
+top_k_zones = 3
+use_value_scoring = true
+use_short_horizon_rollout = false
+fallback_policy = "greedy"
+risk_trigger_soc = 0.18
+planner_mode = "planner"
+
+[evaluation]
+standard_episodes = 1
+stress_episodes = 1
+unseen_fleet_sizes = [8, 12, 16]
+charger_outage_levels = [0.0, 0.5]
+demand_shock_levels = [1.0, 1.2]
+travel_time_shock_levels = [1.0, 1.1]
+event_day_presets = ["baseline", "concert"]

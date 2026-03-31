@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from comet_taxi.config import load_experiment_config
-from comet_taxi.data import prepare_nyc_dataset
+from comet_taxi.data import fit_normalization_statistics, prepare_nyc_dataset
 from comet_taxi.synthetic import write_synthetic_parquet
 
 
@@ -34,6 +34,11 @@ def test_prepare_nyc_dataset_outputs_expected_files(tmp_path: Path) -> None:
         "demand_count",
         "mean_trip_minutes",
         "mean_fare",
+        "charge_price",
+        "travel_time_residual",
     }
     assert expected_columns.issubset(dataset.splits["train"].columns)
     assert len(dataset.metadata["charge_stations"]) == config.env.charge_station_count
+    assert "calibration" in dataset.metadata
+    stats = fit_normalization_statistics(dataset)
+    assert "charge_price_mean" in stats

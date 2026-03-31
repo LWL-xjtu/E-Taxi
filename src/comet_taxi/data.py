@@ -41,6 +41,23 @@ class PreparedDataset:
         return cls(root=dataset_root, metadata=metadata, splits=splits)
 
 
+@dataclass(slots=True)
+class OfflineTransitionDataset:
+    root: Path
+    arrays: dict[str, np.ndarray]
+
+    @classmethod
+    def load(cls, path: str | Path) -> "OfflineTransitionDataset":
+        source = np.load(Path(path), allow_pickle=False)
+        arrays = {key: source[key] for key in source.files}
+        return cls(root=Path(path), arrays=arrays)
+
+    def save(self, path: str | Path) -> Path:
+        target = Path(path)
+        np.savez_compressed(target, **self.arrays)
+        return target
+
+
 def _pick_first_existing(columns: list[str], frame: pd.DataFrame) -> str:
     for column in columns:
         if column in frame.columns:
@@ -186,6 +203,16 @@ def _aggregate(frame: pd.DataFrame) -> pd.DataFrame:
         .sort_values(["service_date", "time_bin", "pickup_cell", "dropoff_cell"])
         .reset_index(drop=True)
     )
+    hour_progress = (
+        grouped["time_bin"].dt.hour
+        + grouped["time_bin"].dt.minute / 60.0
+        - grouped["time_bin"].dt.hour.min()
+    )
+    grouped["charge_price"] = 0.9 + 0.2 * np.sin(hour_progress / 3.0)
+    global_trip_mean = max(float(grouped["mean_trip_minutes"].mean()), 1e-6)
+    grouped["travel_time_residual"] = (
+        grouped["mean_trip_minutes"] - global_trip_mean
+    ) / global_trip_mean
     return grouped
 
 
@@ -214,6 +241,25 @@ def _build_metadata(
     split_dates = {
         split: sorted(frame["service_date"].unique().tolist()) for split, frame in split_frames.items()
     }
+    od_summary = (
+        train_frame.groupby(["pickup_cell", "dropoff_cell"])["mean_trip_minutes"]
+        .mean()
+        .reset_index()
+        .to_dict("records")
+    )
+    demand_summary = (
+        train_frame.groupby(["pickup_cell", "time_bin"])["demand_count"]
+        .sum()
+        .reset_index()
+        .assign(time_bin=lambda frame: frame["time_bin"].astype(str))
+        .to_dict("records")
+    )
+    charge_price_summary = {
+        "mean": float(train_frame["charge_price"].mean()),
+        "std": float(train_frame["charge_price"].std(ddof=0) or 0.0),
+        "min": float(train_frame["charge_price"].min()),
+        "max": float(train_frame["charge_price"].max()),
+    }
     return {
         "data": {
             "grid_rows": config.grid_rows,
@@ -230,6 +276,19 @@ def _build_metadata(
         "global_defaults": {
             "mean_trip_minutes": float(processed["trip_minutes"].mean()),
             "mean_fare": float(processed["mean_fare"].mean()),
+        },
+        "calibration": {
+            "od_travel_time_summary": od_summary,
+            "demand_per_zone_time_summary": demand_summary,
+            "charge_price_summary": charge_price_summary,
+            "charger_metadata_placeholder": [
+                {
+                    "station_zone": int(zone),
+                    "capacity": 4,
+                    "queue_slots": 8,
+                }
+                for zone in charge_stations
+            ],
         },
         "mapping": mapping_metadata,
     }
@@ -280,3 +339,118 @@ def prepare_nyc_dataset(
     )
     dump_json(metadata, dataset_root / "metadata.json")
     return PreparedDataset(root=dataset_root, metadata=metadata, splits=split_frames)
+
+
+def fit_normalization_statistics(dataset: PreparedDataset) -> dict[str, list[float] | float]:
+    train_frame = dataset.splits["train"].copy()
+    demand_series = (
+        train_frame.groupby("pickup_cell")["demand_count"].sum().reindex(
+            range(dataset.metadata["data"]["cell_count"]),
+            fill_value=0.0,
+        )
+    )
+    temporal_scalars = train_frame[["charge_price", "travel_time_residual"]].to_numpy(dtype=np.float32)
+    return {
+        "demand_mean": demand_series.astype(float).tolist(),
+        "demand_std": np.sqrt(np.maximum(demand_series.to_numpy(dtype=np.float32), 1e-6)).tolist(),
+        "charge_price_mean": float(temporal_scalars[:, 0].mean()),
+        "charge_price_std": float(temporal_scalars[:, 0].std() or 1.0),
+        "travel_time_residual_mean": float(temporal_scalars[:, 1].mean()),
+        "travel_time_residual_std": float(temporal_scalars[:, 1].std() or 1.0),
+    }
+
+
+def export_offline_transition_dataset(
+    dataset: PreparedDataset,
+    output_path: str | Path,
+    config: Any,
+    episodes: int | None = None,
+    seed: int | None = None,
+) -> OfflineTransitionDataset:
+    from .baselines import GreedyDispatchPolicy
+    from .env import CometTaxiEnv
+
+    env = CometTaxiEnv(dataset, config, seed=seed if seed is not None else config.train.seed)
+    policy = GreedyDispatchPolicy(config)
+    episode_count = int(episodes if episodes is not None else config.offline_rl.dataset_episodes)
+
+    local_obs: list[np.ndarray] = []
+    fleet_signature: list[np.ndarray] = []
+    temporal_history: list[np.ndarray] = []
+    agent_mask: list[np.ndarray] = []
+    action_mask: list[np.ndarray] = []
+    actions: list[np.ndarray] = []
+    rewards: list[float] = []
+    dones: list[float] = []
+    cost_vectors: list[np.ndarray] = []
+    next_local_obs: list[np.ndarray] = []
+    next_fleet_signature: list[np.ndarray] = []
+    next_temporal_history: list[np.ndarray] = []
+    next_agent_mask: list[np.ndarray] = []
+    next_action_mask: list[np.ndarray] = []
+    next_rewards_to_go: list[float] = []
+    aux_next_demand: list[np.ndarray] = []
+    aux_charger_occupancy: list[np.ndarray] = []
+    aux_travel_residual: list[np.ndarray] = []
+
+    for _ in range(episode_count):
+        observation = env.reset("train")
+        episode_indices: list[int] = []
+        episode_rewards: list[float] = []
+        done = False
+        while not done:
+            action = policy.act(observation)
+            next_observation, _, team_reward, done, info = env.step(action)
+            episode_indices.append(len(rewards))
+            episode_rewards.append(team_reward)
+            local_obs.append(observation["local_obs"])
+            fleet_signature.append(observation["fleet_signature"])
+            temporal_history.append(observation["temporal_history"])
+            agent_mask.append(observation["agent_mask"])
+            action_mask.append(observation["action_mask"])
+            actions.append(action)
+            rewards.append(team_reward)
+            dones.append(float(done))
+            cost_vectors.append(
+                np.asarray([info["costs"][name] for name in ("battery_violation_cost", "charger_overflow_cost", "service_violation_cost")], dtype=np.float32)
+            )
+            next_local_obs.append(next_observation["local_obs"])
+            next_fleet_signature.append(next_observation["fleet_signature"])
+            next_temporal_history.append(next_observation["temporal_history"])
+            next_agent_mask.append(next_observation["agent_mask"])
+            next_action_mask.append(next_observation["action_mask"])
+            aux_next_demand.append(info["aux_targets"]["next_demand"])
+            aux_charger_occupancy.append(info["aux_targets"]["charger_occupancy"])
+            aux_travel_residual.append(np.asarray([info["aux_targets"]["travel_time_residual"]], dtype=np.float32))
+            observation = next_observation
+
+        running_return = 0.0
+        episode_returns: list[float] = []
+        for reward in reversed(episode_rewards):
+            running_return = float(reward) + config.train.gamma * running_return
+            episode_returns.append(running_return)
+        next_rewards_to_go.extend(reversed(episode_returns))
+
+    arrays = {
+        "local_obs": np.stack(local_obs).astype(np.float32),
+        "fleet_signature": np.stack(fleet_signature).astype(np.float32),
+        "temporal_history": np.stack(temporal_history).astype(np.float32),
+        "agent_mask": np.stack(agent_mask).astype(np.float32),
+        "action_mask": np.stack(action_mask).astype(np.float32),
+        "actions": np.stack(actions).astype(np.int64),
+        "rewards": np.asarray(rewards, dtype=np.float32),
+        "returns": np.asarray(next_rewards_to_go, dtype=np.float32),
+        "dones": np.asarray(dones, dtype=np.float32),
+        "costs": np.stack(cost_vectors).astype(np.float32),
+        "next_local_obs": np.stack(next_local_obs).astype(np.float32),
+        "next_fleet_signature": np.stack(next_fleet_signature).astype(np.float32),
+        "next_temporal_history": np.stack(next_temporal_history).astype(np.float32),
+        "next_agent_mask": np.stack(next_agent_mask).astype(np.float32),
+        "next_action_mask": np.stack(next_action_mask).astype(np.float32),
+        "aux_next_demand": np.stack(aux_next_demand).astype(np.float32),
+        "aux_charger_occupancy": np.stack(aux_charger_occupancy).astype(np.float32),
+        "aux_travel_time_residual": np.stack(aux_travel_residual).astype(np.float32),
+    }
+    offline = OfflineTransitionDataset(root=Path(output_path), arrays=arrays)
+    offline.save(output_path)
+    return offline

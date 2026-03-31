@@ -30,33 +30,33 @@ default_charge_price = 1.0
 
 [model]
 variant = "v2"
-zone_embedding_dim = 16
-hidden_dim = 128
-fleet_hidden_dim = 128
+zone_embedding_dim = 20
+hidden_dim = 160
+fleet_hidden_dim = 160
 dropout = 0.1
-aux_hidden_dim = 64
-critic_ensemble_size = 2
-vehicle_token_dim = 128
+aux_hidden_dim = 96
+critic_ensemble_size = 3
+vehicle_token_dim = 160
 use_layer_norm = true
 
 [set_encoder]
-type = "deepsets"
-hidden_dim = 128
+type = "set_transformer"
+hidden_dim = 160
 num_heads = 4
 num_inducing_points = 8
 pooling = "mean"
 use_fleet_signature_skip = true
 
 [temporal]
-history_len = 6
+history_len = 8
 encoder_type = "gru"
-hidden_dim = 96
+hidden_dim = 128
 num_layers = 1
 
 [train]
-seed = 7
+seed = 11
 device = "auto"
-total_episodes = 60
+total_episodes = 80
 rollout_episodes_per_update = 1
 ppo_epochs = 4
 minibatch_size = 16
@@ -76,19 +76,19 @@ save_interval = 10
 [domain_randomization]
 enabled = true
 demand_scale_min = 0.85
-demand_scale_max = 1.15
+demand_scale_max = 1.20
 travel_time_noise_min = 0.90
-travel_time_noise_max = 1.15
+travel_time_noise_max = 1.20
 charge_price_scale_min = 0.90
-charge_price_scale_max = 1.20
-charger_capacity_scale_min = 0.75
+charge_price_scale_max = 1.25
+charger_capacity_scale_min = 0.70
 charger_capacity_scale_max = 1.00
-peak_shock_probability = 0.15
+peak_shock_probability = 0.2
 peak_shock_scale_min = 1.10
-peak_shock_scale_max = 1.50
-event_day_probability = 0.10
+peak_shock_scale_max = 1.60
+event_day_probability = 0.15
 event_day_scale_min = 1.20
-event_day_scale_max = 1.70
+event_day_scale_max = 1.80
 apply_to_eval = false
 
 [reward]
@@ -99,8 +99,8 @@ battery_weight = 1.0
 [offline_rl]
 enabled = true
 algorithm = "iql"
-dataset_episodes = 8
-pretrain_epochs = 2
+dataset_episodes = 10
+pretrain_epochs = 3
 batch_size = 32
 expectile = 0.7
 temperature = 2.0
@@ -108,11 +108,11 @@ cql_alpha = 0.1
 awac_lambda = 1.0
 
 [online_finetune]
-offline_ratio_start = 0.7
+offline_ratio_start = 0.8
 offline_ratio_end = 0.1
-offline_ratio_decay_steps = 100
+offline_ratio_decay_steps = 120
 planner_enabled = true
-uncertainty_threshold = 0.25
+uncertainty_threshold = 0.22
 online_replay_capacity = 4096
 
 [safety]

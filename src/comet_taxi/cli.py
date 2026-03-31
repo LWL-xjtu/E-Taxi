@@ -7,7 +7,14 @@ from .config import load_experiment_config
 from .data import PreparedDataset, prepare_nyc_dataset
 from .env import CometTaxiEnv
 from .evaluation import evaluate_checkpoint, evaluate_greedy
-from .models import COMETActor, infer_model_dimensions
+from .models import (
+    COMETActor,
+    COMETActorV2,
+    CostCritic,
+    EnsembleCritic,
+    ObservationNormalizer,
+    infer_model_dimensions,
+)
 from .trainer import CometTrainer
 
 
@@ -28,7 +35,7 @@ def prepare_nyc_main() -> None:
 
 
 def train_main() -> None:
-    parser = argparse.ArgumentParser(description="Train COMET with MAPPO.")
+    parser = argparse.ArgumentParser(description="Train COMET / COMET-v2.")
     parser.add_argument("--config", default="configs/base.toml")
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -47,13 +54,27 @@ def evaluate_main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--split", default="test")
     parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--stress", action="store_true")
     args = parser.parse_args()
 
     config = load_experiment_config(args.config)
     dataset = PreparedDataset.load(args.data_dir)
     env = CometTaxiEnv(dataset, config, seed=config.train.seed)
-    dims = infer_model_dimensions(dataset.metadata["data"]["cell_count"])
-    actor = COMETActor(config.model, dims)
+    dims = infer_model_dimensions(
+        dataset.metadata["data"]["cell_count"],
+        charger_count=config.env.charge_station_count,
+        history_len=config.temporal.history_len,
+    )
+    if config.model.variant == "legacy":
+        actor = COMETActor(config.model, dims)
+        critic = None
+        cost_critic = None
+        normalizer = None
+    else:
+        actor = COMETActorV2(config.model, config.set_encoder, config.temporal, dims)
+        critic = EnsembleCritic(config.model, config.set_encoder, config.temporal, dims)
+        cost_critic = CostCritic(config.model, config.set_encoder, config.temporal, dims)
+        normalizer = ObservationNormalizer(dims)
     evaluate_checkpoint(
         config=config,
         env=env,
@@ -62,6 +83,10 @@ def evaluate_main() -> None:
         output_dir=Path(args.output_dir),
         split=args.split,
         episodes=args.episodes,
+        critic=critic,
+        cost_critic=cost_critic,
+        normalizer=normalizer,
+        stress=args.stress,
     )
 
 
@@ -72,6 +97,7 @@ def run_greedy_baseline_main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--split", default="test")
     parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--stress", action="store_true")
     args = parser.parse_args()
 
     config = load_experiment_config(args.config)
@@ -83,4 +109,5 @@ def run_greedy_baseline_main() -> None:
         output_dir=Path(args.output_dir),
         split=args.split,
         episodes=args.episodes,
+        stress=args.stress,
     )

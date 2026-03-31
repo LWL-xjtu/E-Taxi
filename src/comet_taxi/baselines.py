@@ -24,9 +24,11 @@ class GreedyDispatchPolicy:
 
     def act(self, observation: dict[str, np.ndarray]) -> np.ndarray:
         actions = np.zeros(self.config.env.nmax, dtype=np.int64)
-        demand = observation["fleet_signature"][
-            self.cell_count * 4 * 3 : self.cell_count * 4 * 3 + self.cell_count
-        ]
+        demand = observation.get("demand_vector")
+        if demand is None:
+            demand = observation["fleet_signature"][
+                self.cell_count * 4 * 3 : self.cell_count * 4 * 3 + self.cell_count
+            ]
 
         for slot in range(self.config.env.nmax):
             if observation["agent_mask"][slot] <= 0:
@@ -37,7 +39,12 @@ class GreedyDispatchPolicy:
             if action_mask[ACTION_ACCEPT_ORDER] > 0:
                 actions[slot] = ACTION_ACCEPT_ORDER
                 continue
-            if soc < self.config.env.battery_low_threshold and action_mask[ACTION_GO_CHARGE] > 0:
+            charger_queue = observation.get("charger_queue")
+            if (
+                soc < self.config.planner.risk_trigger_soc
+                and action_mask[ACTION_GO_CHARGE] > 0
+                and (charger_queue is None or np.mean(charger_queue) <= self.config.env.max_queue_length)
+            ):
                 actions[slot] = ACTION_GO_CHARGE
                 continue
 
