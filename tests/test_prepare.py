@@ -29,16 +29,27 @@ def test_prepare_nyc_dataset_outputs_expected_files(tmp_path: Path) -> None:
     expected_columns = {
         "service_date",
         "time_bin",
+        "time_bin_index",
+        "pickup_location_id",
+        "dropoff_location_id",
         "pickup_cell",
         "dropoff_cell",
-        "demand_count",
-        "mean_trip_minutes",
-        "mean_fare",
+        "trip_distance_km",
+        "trip_minutes",
+        "fare_amount",
+        "revenue_amount",
         "charge_price",
         "travel_time_residual",
     }
     assert expected_columns.issubset(dataset.splits["train"].columns)
     assert len(dataset.metadata["charge_stations"]) == config.env.charge_station_count
     assert "calibration" in dataset.metadata
+    assert dataset.metadata["data"]["zone_mode"] == "tlc_location_id"
+    first_day = dataset.metadata["splits"]["train"][0]
+    day_orders = dataset.get_day_orders(first_day, split="train")
+    assert not day_orders.empty
+    bin_orders = dataset.get_orders_for_day_and_bin(first_day, 0, split="train")
+    assert isinstance(bin_orders, type(day_orders))
     stats = fit_normalization_statistics(dataset)
     assert "charge_price_mean" in stats
+    assert "trip_distance_km_mean" in stats

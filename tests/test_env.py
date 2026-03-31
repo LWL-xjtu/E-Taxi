@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from copy import deepcopy
 
 import numpy as np
 
@@ -55,7 +56,7 @@ def test_charger_overflow_logic_is_exposed(tmp_path: Path) -> None:
     for vehicle in env.vehicles:
         vehicle.zone = charge_zone
         vehicle.mode = 0
-        vehicle.soc = 0.1
+        vehicle.battery_kwh = 6.0
     observation = env._build_observation()
     actions = np.full(env.config.env.nmax, ACTION_GO_CHARGE, dtype=np.int64)
     _, _, _, _, info = env.step(actions)
@@ -79,3 +80,22 @@ def test_history_buffer_updates(tmp_path: Path) -> None:
     env.step(np.zeros(env.config.env.nmax, dtype=np.int64))
     after = env._build_observation()["temporal_history"]
     assert not np.array_equal(before, after)
+
+
+def test_history_length_is_configurable(tmp_path: Path) -> None:
+    base_config = load_experiment_config("configs/smoke.toml")
+    config = deepcopy(base_config)
+    config.temporal.history_len = 2
+    parquet_path = tmp_path / "synthetic.parquet"
+    output_dir = tmp_path / "prepared"
+    write_synthetic_parquet(parquet_path, rows_per_step=6)
+    prepare_nyc_dataset(
+        parquet_path,
+        output_dir,
+        config.data,
+        charge_station_count=config.env.charge_station_count,
+    )
+    dataset = PreparedDataset.load(output_dir)
+    env = CometTaxiEnv(dataset, config, seed=3)
+    observation = env.reset("train")
+    assert observation["temporal_history"].shape[0] == 2

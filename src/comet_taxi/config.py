@@ -14,6 +14,8 @@ except ModuleNotFoundError:  # pragma: no cover
 class DataConfig:
     grid_rows: int = 8
     grid_cols: int = 8
+    zone_mode: str = "grid"
+    zone_count_override: int = 263
     step_minutes: int = 10
     start_hour: int = 8
     end_hour: int = 20
@@ -24,12 +26,18 @@ class DataConfig:
 
     @property
     def cell_count(self) -> int:
+        if self.zone_mode == "tlc_location_id":
+            return self.zone_count_override
         return self.grid_rows * self.grid_cols
 
     @property
     def episode_steps(self) -> int:
         minutes = (self.end_hour - self.start_hour) * 60
         return minutes // self.step_minutes
+
+    @property
+    def time_bins_per_day(self) -> int:
+        return (24 * 60) // self.step_minutes
 
 
 @dataclass(slots=True)
@@ -52,6 +60,14 @@ class EnvConfig:
     service_violation_penalty: float = 0.05
     default_charge_price: float = 1.0
     travel_time_noise_base: float = 0.0
+    battery_capacity_kwh: float = 60.0
+    battery_min_kwh: float = 5.0
+    init_battery_min_ratio: float = 0.40
+    init_battery_max_ratio: float = 1.00
+    energy_per_km: float = 0.15
+    charge_power_kw: float = 50.0
+    reposition_distance_km: float = 2.0
+    death_penalty: float = 25.0
 
 
 @dataclass(slots=True)
@@ -177,6 +193,10 @@ class PlannerConfig:
     fallback_policy: str = "greedy"
     risk_trigger_soc: float = 0.18
     planner_mode: str = "planner"
+    actor_prior_weight: float = 1.0
+    value_weight: float = 0.1
+    cost_penalty_weight: float = 0.5
+    uncertainty_penalty_weight: float = 0.25
 
 
 @dataclass(slots=True)

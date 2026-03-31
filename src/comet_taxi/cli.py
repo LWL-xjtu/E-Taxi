@@ -62,7 +62,7 @@ def evaluate_main() -> None:
     env = CometTaxiEnv(dataset, config, seed=config.train.seed)
     dims = infer_model_dimensions(
         dataset.metadata["data"]["cell_count"],
-        charger_count=config.env.charge_station_count,
+        charger_count=len(dataset.metadata["charge_stations"]),
         history_len=config.temporal.history_len,
     )
     if config.model.variant == "legacy":

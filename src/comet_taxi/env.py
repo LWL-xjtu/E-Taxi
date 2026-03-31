@@ -1,6 +1,6 @@
+﻿from __future__ import annotations
 
-from __future__ import annotations
-
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,18 +27,32 @@ from .constants import (
 from .data import PreparedDataset
 from .utils import as_float32
 
+MOVE_ACTIONS = (
+    ACTION_MOVE_NORTH,
+    ACTION_MOVE_SOUTH,
+    ACTION_MOVE_EAST,
+    ACTION_MOVE_WEST,
+)
+MOVE_TO_INDEX = {
+    ACTION_MOVE_NORTH: 0,
+    ACTION_MOVE_SOUTH: 1,
+    ACTION_MOVE_EAST: 2,
+    ACTION_MOVE_WEST: 3,
+}
+
 
 @dataclass(slots=True)
 class VehicleState:
     vehicle_id: int
     zone: int
-    soc: float
+    battery_kwh: float
     mode: int = MODE_IDLE
     remaining_steps: int = 0
     destination_zone: int | None = None
     idle_steps: int = 0
     requested_charge: bool = False
     assigned_station: int | None = None
+    alive: bool = True
 
 
 class CometTaxiEnv:
@@ -54,7 +68,10 @@ class CometTaxiEnv:
         self.rng = np.random.default_rng(self.base_seed)
         self.cell_count = int(self.dataset.metadata["data"]["cell_count"])
         self.episode_steps = int(self.dataset.metadata["data"]["episode_steps"])
+        self.time_bins_per_day = int(self.dataset.metadata["data"].get("time_bins_per_day", 144))
+        self.start_bin = int(self.dataset.metadata["data"]["start_hour"] * 60 // self.config.data.step_minutes)
         self.charge_stations = [int(zone) for zone in self.dataset.metadata["charge_stations"]]
+        self.charge_station_count = len(self.charge_stations)
         self.zone_demand_priors = np.asarray(
             self.dataset.metadata["zone_demand_priors"], dtype=np.float32
         )
@@ -62,19 +79,24 @@ class CometTaxiEnv:
             self.dataset.metadata["global_defaults"]["mean_trip_minutes"]
         )
         self.global_mean_fare = float(self.dataset.metadata["global_defaults"]["mean_fare"])
+        self.zone_neighbors = self._load_zone_neighbors()
+        self.next_hop_matrix, self.distance_matrix = self._build_shortest_hops()
+        self.nearest_charge_station, self.next_hop_to_station = self._build_charger_routes()
         self._split_index = self._build_split_index()
         self.current_split = "train"
         self.current_day = ""
         self.current_step = 0
-        self.current_time_bins: list[pd.Timestamp] = []
+        self.current_bin_index = self.start_bin
         self.current_demand_vector = np.zeros(self.cell_count, dtype=np.float32)
         self.current_charge_price = self.config.env.default_charge_price
         self.current_demand_scale = 1.0
         self.current_travel_noise = 1.0
+        self.current_charge_price_scale = 1.0
         self.current_event_scale = 1.0
         self.current_charger_capacity_scale = 1.0
         self.current_delay_summary = 0.0
         self.current_peak_shock = 1.0
+        self.current_orders_available = 0.0
         self.remaining_orders: dict[int, list[dict[str, float]]] = {}
         self.vehicles: list[VehicleState] = []
         self.slot_to_vehicle: list[int] = []
@@ -91,21 +113,81 @@ class CometTaxiEnv:
         self.temporal_history = np.zeros(
             (
                 self.history_len,
-                self.cell_count + 1 + self.config.env.charge_station_count * 2 + 2,
+                self.cell_count + 1 + self.charge_station_count * 2 + 2,
             ),
             dtype=np.float32,
         )
-        self.charger_occupancy = np.zeros(self.config.env.charge_station_count, dtype=np.float32)
-        self.charger_queue = np.zeros(self.config.env.charge_station_count, dtype=np.float32)
+        self.charger_occupancy = np.zeros(self.charge_station_count, dtype=np.float32)
+        self.charger_queue = np.zeros(self.charge_station_count, dtype=np.float32)
 
-    def _build_split_index(self) -> dict[str, dict[str, dict[pd.Timestamp, pd.DataFrame]]]:
-        index: dict[str, dict[str, dict[pd.Timestamp, pd.DataFrame]]] = {}
+    def _load_zone_neighbors(self) -> np.ndarray:
+        raw_neighbors = self.dataset.metadata.get("mapping", {}).get("zone_neighbors", {})
+        matrix = np.zeros((self.cell_count, 4), dtype=np.int64)
+        for zone in range(self.cell_count):
+            values = raw_neighbors.get(str(zone), [])
+            cleaned = [
+                int(value)
+                for value in values
+                if 0 <= int(value) < self.cell_count and int(value) != zone
+            ]
+            while len(cleaned) < 4:
+                cleaned.append(zone)
+            matrix[zone] = np.asarray(cleaned[:4], dtype=np.int64)
+        return matrix
+
+    def _build_shortest_hops(self) -> tuple[np.ndarray, np.ndarray]:
+        adjacency = [
+            [
+                int(neighbor)
+                for neighbor in neighbors
+                if 0 <= int(neighbor) < self.cell_count and int(neighbor) != zone
+            ]
+            for zone, neighbors in enumerate(self.zone_neighbors)
+        ]
+        next_hop = np.full((self.cell_count, self.cell_count), -1, dtype=np.int64)
+        distance = np.full((self.cell_count, self.cell_count), self.cell_count + 1, dtype=np.int64)
+        for source in range(self.cell_count):
+            queue: deque[int] = deque([source])
+            distance[source, source] = 0
+            next_hop[source, source] = source
+            while queue:
+                zone = queue.popleft()
+                for neighbor in adjacency[zone]:
+                    if distance[source, neighbor] <= distance[source, zone] + 1:
+                        continue
+                    distance[source, neighbor] = distance[source, zone] + 1
+                    next_hop[source, neighbor] = neighbor if zone == source else next_hop[source, zone]
+                    queue.append(neighbor)
+            fallback_neighbors = adjacency[source] or [source]
+            for target in range(self.cell_count):
+                if next_hop[source, target] < 0:
+                    next_hop[source, target] = fallback_neighbors[0]
+                    distance[source, target] = 999
+        return next_hop, distance
+
+    def _build_charger_routes(self) -> tuple[np.ndarray, np.ndarray]:
+        nearest_station = np.zeros(self.cell_count, dtype=np.int64)
+        next_hop = np.zeros(self.cell_count, dtype=np.int64)
+        for zone in range(self.cell_count):
+            best_station = self.charge_stations[0]
+            best_distance = self.distance_matrix[zone, best_station]
+            for station in self.charge_stations[1:]:
+                candidate_distance = self.distance_matrix[zone, station]
+                if candidate_distance < best_distance:
+                    best_station = station
+                    best_distance = candidate_distance
+            nearest_station[zone] = best_station
+            next_hop[zone] = self.next_hop_matrix[zone, best_station]
+        return nearest_station, next_hop
+
+    def _build_split_index(self) -> dict[str, dict[str, dict[int, pd.DataFrame]]]:
+        index: dict[str, dict[str, dict[int, pd.DataFrame]]] = {}
         for split, frame in self.dataset.splits.items():
-            split_days: dict[str, dict[pd.Timestamp, pd.DataFrame]] = {}
+            split_days: dict[str, dict[int, pd.DataFrame]] = {}
             for day, day_frame in frame.groupby("service_date"):
                 split_days[str(day)] = {
-                    pd.Timestamp(time_bin): time_frame.reset_index(drop=True)
-                    for time_bin, time_frame in day_frame.groupby("time_bin")
+                    int(time_bin): time_frame.reset_index(drop=True)
+                    for time_bin, time_frame in day_frame.groupby("time_bin_index")
                 }
             index[split] = split_days
         return index
@@ -164,9 +246,7 @@ class CometTaxiEnv:
             scenario.get("peak_shock_scale", 1.0)
         ) * float(scenario.get("event_scale", 1.0))
         self.current_travel_noise = float(scenario.get("travel_noise", 1.0))
-        self.current_charge_price = float(self.config.env.default_charge_price) * float(
-            scenario.get("charge_price_scale", 1.0)
-        )
+        self.current_charge_price_scale = float(scenario.get("charge_price_scale", 1.0))
         self.current_charger_capacity_scale = float(scenario.get("charger_capacity_scale", 1.0))
         self.current_peak_shock = float(scenario.get("peak_shock_scale", 1.0))
         self.current_event_scale = float(scenario.get("event_scale", 1.0))
@@ -182,11 +262,21 @@ class CometTaxiEnv:
             "uncertainty_count": float(uncertainty_count),
             "planner_steps": float(planner_steps),
         }
+
     def _sample_zone(self) -> int:
         return int(self.rng.choice(np.arange(self.cell_count), p=self.zone_demand_priors))
 
-    def _sample_soc(self) -> float:
-        return float(np.clip(self.rng.beta(2.5, 1.8), 0.18, 1.0))
+    def _sample_battery_kwh(self) -> float:
+        minimum = self.config.env.init_battery_min_ratio * self.config.env.battery_capacity_kwh
+        maximum = self.config.env.init_battery_max_ratio * self.config.env.battery_capacity_kwh
+        return float(self.rng.uniform(minimum, maximum))
+
+    def _default_charge_price_for_bin(self, bin_index: int) -> float:
+        fraction = float(bin_index / max(self.time_bins_per_day, 1))
+        price = 0.92 + 0.10 * np.sin(2.0 * np.pi * (fraction - 0.15))
+        if 42 <= bin_index <= 60 or 96 <= bin_index <= 114:
+            price += 0.12
+        return float(price)
 
     def reset(
         self,
@@ -196,13 +286,8 @@ class CometTaxiEnv:
     ) -> dict[str, np.ndarray]:
         self.current_split = split
         self.current_day = day or self._sample_day(split)
-        self.current_time_bins = list(
-            pd.date_range(
-                start=f"{self.current_day} {self.dataset.metadata['data']['start_hour']:02d}:00",
-                periods=self.episode_steps,
-                freq=f"{self.dataset.metadata['data']['step_minutes']}min",
-            )
-        )
+        self.current_step = 0
+        self.current_bin_index = self.start_bin
         effective_scenario = self._build_scenario(split, overrides=scenario)
         self._apply_scenario(effective_scenario)
         active_count = self._sample_vehicle_count(effective_scenario)
@@ -210,11 +295,10 @@ class CometTaxiEnv:
             VehicleState(
                 vehicle_id=vehicle_id,
                 zone=self._sample_zone(),
-                soc=self._sample_soc(),
+                battery_kwh=self._sample_battery_kwh(),
             )
             for vehicle_id in range(active_count)
         ]
-        self.current_step = 0
         self.done = False
         self.charger_occupancy.fill(0.0)
         self.charger_queue.fill(0.0)
@@ -230,6 +314,7 @@ class CometTaxiEnv:
             "profit_total": 0.0,
             "empty_moves": 0.0,
             "low_battery_violations": 0.0,
+            "dead_vehicles": 0.0,
             "charging_steps": 0.0,
             "charge_need_steps": 0.0,
             "charge_response_steps": 0.0,
@@ -242,6 +327,7 @@ class CometTaxiEnv:
             "uncertainty_count": 0.0,
             "fallback_count": 0.0,
             "planner_steps": 0.0,
+            "initial_agents": float(active_count),
         }
         self._refresh_orders()
         self._update_temporal_history()
@@ -251,53 +337,50 @@ class CometTaxiEnv:
             "aux_targets": self._build_aux_targets(done=False),
         }
         return observation
+    def _resample_order_rows(self, rows: pd.DataFrame, scale: float) -> pd.DataFrame:
+        if rows.empty:
+            return rows.copy()
+        target_count = int(round(len(rows) * scale))
+        if target_count <= 0:
+            return rows.iloc[0:0].copy().reset_index(drop=True)
+        indices = self.rng.choice(
+            len(rows),
+            size=target_count,
+            replace=target_count > len(rows),
+        )
+        return rows.iloc[np.asarray(indices, dtype=np.int64)].reset_index(drop=True)
 
     def _refresh_orders(self) -> None:
-        time_bin = self.current_time_bins[self.current_step]
         rows = self._split_index[self.current_split].get(self.current_day, {}).get(
-            pd.Timestamp(time_bin), pd.DataFrame()
+            int(self.current_bin_index), pd.DataFrame()
         )
+        sampled_rows = self._resample_order_rows(rows, self.current_demand_scale) if not rows.empty else rows
         remaining_orders: dict[int, list[dict[str, float]]] = {}
         demand_vector = np.zeros(self.cell_count, dtype=np.float32)
-        total_orders = 0
         delay_values: list[float] = []
-        charge_price = self.current_charge_price
-        if not rows.empty:
-            for record in rows.to_dict("records"):
-                scaled_count = int(round(float(record["demand_count"]) * self.current_demand_scale))
-                if scaled_count <= 0:
-                    continue
-                pickup_cell = int(record["pickup_cell"])
-                dropoff_cell = int(record["dropoff_cell"])
-                trip_steps = max(
-                    1,
-                    int(
-                        round(
-                            float(record["mean_trip_minutes"])
-                            * self.current_travel_noise
-                            / self.config.data.step_minutes
-                        )
-                    ),
-                )
-                remaining_orders.setdefault(pickup_cell, []).append(
-                    {
-                        "dropoff_cell": dropoff_cell,
-                        "count": scaled_count,
-                        "trip_steps": trip_steps,
-                        "mean_fare": float(record["mean_fare"]),
-                    }
-                )
-                demand_vector[pickup_cell] += scaled_count
-                total_orders += scaled_count
-                delay_values.append(float(record.get("travel_time_residual", 0.0)) * self.current_travel_noise)
-                charge_price = float(record.get("charge_price", charge_price)) * (
-                    self.current_charge_price / max(self.config.env.default_charge_price, 1e-6)
-                )
+        for record in sampled_rows.to_dict("records"):
+            pickup_cell = int(record["pickup_cell"])
+            trip_minutes = float(record["trip_minutes"]) * self.current_travel_noise
+            order = {
+                "dropoff_cell": int(record["dropoff_cell"]),
+                "trip_steps": max(1, int(np.ceil(trip_minutes / self.config.data.step_minutes))),
+                "trip_minutes": trip_minutes,
+                "trip_distance_km": float(record["trip_distance_km"]),
+                "revenue_amount": float(record.get("revenue_amount", record.get("fare_amount", self.global_mean_fare))),
+            }
+            remaining_orders.setdefault(pickup_cell, []).append(order)
+            demand_vector[pickup_cell] += 1.0
+            delay_values.append(float(record.get("travel_time_residual", 0.0)) * self.current_travel_noise)
+        self.current_orders_available = float(len(sampled_rows))
+        self.metrics["orders_available"] += self.current_orders_available
         self.current_delay_summary = float(np.mean(delay_values) if delay_values else 0.0)
-        self.current_charge_price = float(charge_price)
+        if sampled_rows.empty:
+            base_price = self._default_charge_price_for_bin(self.current_bin_index)
+        else:
+            base_price = float(sampled_rows["charge_price"].mean())
+        self.current_charge_price = base_price * self.current_charge_price_scale
         self.current_demand_vector = demand_vector
         self.remaining_orders = remaining_orders
-        self.metrics["orders_available"] += total_orders
 
     def _update_temporal_history(self) -> None:
         demand_total = max(float(self.current_demand_vector.sum()), 1.0)
@@ -325,93 +408,73 @@ class CometTaxiEnv:
         vector[mode] = 1.0
         return vector
 
-    def _battery_bucket(self, soc: float) -> int:
-        if soc < self.config.env.battery_low_threshold:
+    def _battery_ratio(self, battery_kwh: float) -> float:
+        return float(np.clip(battery_kwh / max(self.config.env.battery_capacity_kwh, 1e-6), 0.0, 1.0))
+
+    def _battery_bucket(self, battery_kwh: float) -> int:
+        ratio = self._battery_ratio(battery_kwh)
+        if ratio < self.config.env.battery_low_threshold:
             return 0
-        if soc < self.config.env.battery_mid_threshold:
+        if ratio < self.config.env.battery_mid_threshold:
             return 1
         return 2
 
-    def _battery_one_hot(self, soc: float) -> np.ndarray:
-        bucket = self._battery_bucket(soc)
+    def _battery_one_hot(self, battery_kwh: float) -> np.ndarray:
+        bucket = self._battery_bucket(battery_kwh)
         vector = np.zeros(3, dtype=np.float32)
         vector[bucket] = 1.0
         return vector
 
-    def _zone_to_row_col(self, zone: int) -> tuple[int, int]:
-        return divmod(zone, self.config.data.grid_cols)
-
-    def _row_col_to_zone(self, row: int, col: int) -> int:
-        return row * self.config.data.grid_cols + col
-
     def _move_zone(self, zone: int, action: int) -> int:
-        row, col = self._zone_to_row_col(zone)
-        if action == ACTION_MOVE_NORTH:
-            row = max(0, row - 1)
-        elif action == ACTION_MOVE_SOUTH:
-            row = min(self.config.data.grid_rows - 1, row + 1)
-        elif action == ACTION_MOVE_EAST:
-            col = min(self.config.data.grid_cols - 1, col + 1)
-        elif action == ACTION_MOVE_WEST:
-            col = max(0, col - 1)
-        return self._row_col_to_zone(row, col)
+        if action not in MOVE_TO_INDEX:
+            return zone
+        return int(self.zone_neighbors[zone, MOVE_TO_INDEX[action]])
 
     def _nearest_charge_station(self, zone: int) -> int:
-        row, col = self._zone_to_row_col(zone)
-        best_station = zone
-        best_distance = 1_000_000
-        for station in self.charge_stations:
-            station_row, station_col = self._zone_to_row_col(station)
-            distance = abs(station_row - row) + abs(station_col - col)
-            if distance < best_distance:
-                best_station = station
-                best_distance = distance
-        return best_station
+        return int(self.nearest_charge_station[zone])
 
     def _step_toward_zone(self, zone: int, target_zone: int) -> int:
-        row, col = self._zone_to_row_col(zone)
-        target_row, target_col = self._zone_to_row_col(target_zone)
-        if row < target_row:
-            row += 1
-        elif row > target_row:
-            row -= 1
-        elif col < target_col:
-            col += 1
-        elif col > target_col:
-            col -= 1
-        return self._row_col_to_zone(row, col)
+        if target_zone == zone:
+            return zone
+        candidate = int(self.next_hop_matrix[zone, target_zone])
+        if candidate == zone:
+            neighbor_zones = self.zone_neighbors[zone]
+            best_neighbor = zone
+            best_demand = -1.0
+            for neighbor in neighbor_zones:
+                neighbor = int(neighbor)
+                demand = float(self.current_demand_vector[neighbor])
+                if demand > best_demand:
+                    best_neighbor = neighbor
+                    best_demand = demand
+            return best_neighbor
+        return candidate
 
     def _take_order(self, pickup_zone: int) -> dict[str, float] | None:
         options = self.remaining_orders.get(pickup_zone, [])
         if not options:
             return None
-        best_index = int(np.argmax([option["count"] for option in options]))
-        order = options[best_index]
-        order["count"] -= 1
-        if order["count"] <= 0:
-            options.pop(best_index)
+        order = options.pop(0)
         if not options:
             self.remaining_orders.pop(pickup_zone, None)
         self.current_demand_vector[pickup_zone] = max(0.0, self.current_demand_vector[pickup_zone] - 1.0)
         return order
+
     def _action_mask_for_vehicle(self, vehicle: VehicleState) -> np.ndarray:
         mask = np.zeros(ACTION_DIM, dtype=np.float32)
-        if vehicle.mode in (MODE_SERVING, MODE_REPOSITIONING):
+        if not vehicle.alive:
+            return mask
+        if vehicle.mode in (MODE_SERVING, MODE_REPOSITIONING, MODE_CHARGING):
             mask[ACTION_STAY] = 1.0
             return mask
         mask[ACTION_STAY] = 1.0
-        if self.current_demand_vector[vehicle.zone] > 0 and vehicle.mode == MODE_IDLE:
+        if self.current_demand_vector[vehicle.zone] > 0:
             mask[ACTION_ACCEPT_ORDER] = 1.0
         mask[ACTION_GO_CHARGE] = 1.0
-        row, col = self._zone_to_row_col(vehicle.zone)
-        if row > 0:
-            mask[ACTION_MOVE_NORTH] = 1.0
-        if row < self.config.data.grid_rows - 1:
-            mask[ACTION_MOVE_SOUTH] = 1.0
-        if col < self.config.data.grid_cols - 1:
-            mask[ACTION_MOVE_EAST] = 1.0
-        if col > 0:
-            mask[ACTION_MOVE_WEST] = 1.0
+        for action in MOVE_ACTIONS:
+            next_zone = self._move_zone(vehicle.zone, action)
+            if next_zone != vehicle.zone:
+                mask[action] = 1.0
         return mask
 
     def _shuffle_slots(self) -> None:
@@ -423,7 +486,9 @@ class CometTaxiEnv:
     def _build_fleet_signature(self) -> np.ndarray:
         histogram = np.zeros((self.cell_count, 4, 3), dtype=np.float32)
         for vehicle in self.vehicles:
-            histogram[vehicle.zone, vehicle.mode, self._battery_bucket(vehicle.soc)] += 1.0
+            if not vehicle.alive:
+                continue
+            histogram[vehicle.zone, vehicle.mode, self._battery_bucket(vehicle.battery_kwh)] += 1.0
         fleet_hist = histogram.reshape(-1)
         if len(self.vehicles) > 0:
             fleet_hist = fleet_hist / float(len(self.vehicles))
@@ -451,7 +516,11 @@ class CometTaxiEnv:
         ).astype(np.float32)
         return signature
 
-    def _build_candidate_context(self, nearest_station_zones: np.ndarray) -> dict[str, np.ndarray]:
+    def _build_candidate_context(
+        self,
+        nearest_station_zones: np.ndarray,
+        move_target_zones: np.ndarray,
+    ) -> dict[str, np.ndarray]:
         ranked_demand_zones = np.argsort(-self.current_demand_vector).astype(np.int64)
         return {
             "demand_vector": as_float32(self.current_demand_vector.copy()),
@@ -460,6 +529,7 @@ class CometTaxiEnv:
             "charger_occupancy": as_float32(self.charger_occupancy.copy()),
             "charger_queue": as_float32(self.charger_queue.copy()),
             "nearest_charger_zone": nearest_station_zones.astype(np.int64),
+            "move_target_zones": move_target_zones.astype(np.int64),
         }
 
     def _build_observation(self) -> dict[str, np.ndarray]:
@@ -468,24 +538,27 @@ class CometTaxiEnv:
         action_mask = np.zeros((self.config.env.nmax, ACTION_DIM), dtype=np.float32)
         agent_mask = np.zeros(self.config.env.nmax, dtype=np.float32)
         nearest_station_zones = np.zeros(self.config.env.nmax, dtype=np.int64)
+        move_target_zones = np.zeros((self.config.env.nmax, 4), dtype=np.int64)
 
         for slot_index, vehicle_index in enumerate(self.slot_to_vehicle):
             vehicle = self.vehicles[vehicle_index]
             agent_mask[slot_index] = 1.0
             local_obs[slot_index, 0] = vehicle.zone + 1
-            local_obs[slot_index, 1:4] = self._battery_one_hot(vehicle.soc)
-            local_obs[slot_index, 4] = vehicle.soc
+            local_obs[slot_index, 1:4] = self._battery_one_hot(vehicle.battery_kwh)
+            local_obs[slot_index, 4] = self._battery_ratio(vehicle.battery_kwh)
             local_obs[slot_index, 5:9] = self._mode_one_hot(vehicle.mode)
             local_obs[slot_index, 9] = vehicle.remaining_steps / max(self.episode_steps, 1)
             action_mask[slot_index] = self._action_mask_for_vehicle(vehicle)
             nearest_station_zones[slot_index] = self._nearest_charge_station(vehicle.zone)
+            move_target_zones[slot_index] = self.zone_neighbors[vehicle.zone]
 
         self.agent_mask = agent_mask
-        candidate_context = self._build_candidate_context(nearest_station_zones)
+        candidate_context = self._build_candidate_context(nearest_station_zones, move_target_zones)
         return {
             "local_obs": as_float32(local_obs),
             "fleet_signature": as_float32(self._build_fleet_signature()),
             "agent_mask": as_float32(agent_mask),
+            "active_masks": as_float32(agent_mask),
             "action_mask": as_float32(action_mask),
             "temporal_history": as_float32(self.temporal_history.copy()),
             **candidate_context,
@@ -501,21 +574,36 @@ class CometTaxiEnv:
 
     def _battery_penalty(self, vehicle: VehicleState, include_charge_price: bool = False) -> float:
         penalty = 0.0
-        if vehicle.soc < self.config.env.battery_low_threshold:
+        ratio = self._battery_ratio(vehicle.battery_kwh)
+        if ratio < self.config.env.battery_low_threshold:
             penalty += self.config.env.low_battery_penalty_weight * (
-                self.config.env.battery_low_threshold - vehicle.soc
+                self.config.env.battery_low_threshold - ratio
             )
             self.metrics["low_battery_violations"] += 1.0
         if include_charge_price:
             penalty += 0.02 * self.current_charge_price
         return penalty
 
+    def _kill_vehicle_if_needed(self, vehicle: VehicleState) -> float:
+        if vehicle.battery_kwh >= self.config.env.battery_min_kwh:
+            return 0.0
+        vehicle.alive = False
+        vehicle.mode = MODE_IDLE
+        vehicle.remaining_steps = 0
+        vehicle.destination_zone = None
+        self.metrics["dead_vehicles"] += 1.0
+        return self.config.env.death_penalty
+
+    def _consume_reposition_energy(self, vehicle: VehicleState) -> None:
+        vehicle.battery_kwh = max(
+            0.0,
+            vehicle.battery_kwh - self.config.env.reposition_distance_km * self.config.env.energy_per_km,
+        )
     def _update_busy_vehicle(self, vehicle: VehicleState) -> float:
         battery_penalty = 0.0
         vehicle.requested_charge = False
         if vehicle.mode == MODE_SERVING:
             vehicle.remaining_steps = max(0, vehicle.remaining_steps - 1)
-            vehicle.soc = max(0.0, vehicle.soc - self.config.env.service_consumption)
             if vehicle.remaining_steps == 0:
                 if vehicle.destination_zone is not None:
                     vehicle.zone = vehicle.destination_zone
@@ -523,14 +611,14 @@ class CometTaxiEnv:
                 vehicle.mode = MODE_IDLE
         elif vehicle.mode == MODE_REPOSITIONING:
             vehicle.remaining_steps = max(0, vehicle.remaining_steps - 1)
-            vehicle.soc = max(0.0, vehicle.soc - self.config.env.move_consumption)
             if vehicle.remaining_steps == 0:
                 vehicle.mode = MODE_IDLE
         elif vehicle.mode == MODE_CHARGING:
             vehicle.requested_charge = True
             vehicle.assigned_station = vehicle.zone
         battery_penalty += self._battery_penalty(vehicle)
-        return self._compose_reward(0.0, 0.0, battery_penalty)
+        death_penalty = self._kill_vehicle_if_needed(vehicle)
+        return self._compose_reward(0.0, 0.0, battery_penalty) - death_penalty
 
     def _step_idle_vehicle(self, vehicle: VehicleState, action: int) -> float:
         profit = 0.0
@@ -538,7 +626,7 @@ class CometTaxiEnv:
         battery_penalty = 0.0
         vehicle.requested_charge = False
 
-        if vehicle.soc < self.config.env.battery_mid_threshold:
+        if self._battery_ratio(vehicle.battery_kwh) < self.config.env.battery_mid_threshold:
             self.metrics["charge_need_steps"] += 1.0
             if action == ACTION_GO_CHARGE or vehicle.mode == MODE_CHARGING:
                 self.metrics["charge_response_steps"] += 1.0
@@ -550,10 +638,14 @@ class CometTaxiEnv:
                 vehicle.destination_zone = int(order["dropoff_cell"])
                 vehicle.remaining_steps = int(order["trip_steps"])
                 vehicle.idle_steps = 0
-                profit += float(order["mean_fare"])
-                vehicle.soc = max(0.0, vehicle.soc - self.config.env.service_consumption)
+                profit += float(order["revenue_amount"])
+                vehicle.battery_kwh = max(
+                    0.0,
+                    vehicle.battery_kwh
+                    - float(order["trip_distance_km"]) * self.config.env.energy_per_km,
+                )
                 self.metrics["orders_served"] += 1.0
-                self.metrics["profit_total"] += float(order["mean_fare"])
+                self.metrics["profit_total"] += float(order["revenue_amount"])
             else:
                 efficiency_penalty += self.config.env.idle_penalty
                 vehicle.idle_steps += 1
@@ -565,31 +657,32 @@ class CometTaxiEnv:
                 vehicle.assigned_station = target_station
                 battery_penalty += 0.02 * self.current_charge_price
             else:
-                next_zone = self._step_toward_zone(vehicle.zone, target_station)
+                next_zone = int(self.next_hop_to_station[vehicle.zone])
                 if next_zone != vehicle.zone:
                     vehicle.zone = next_zone
                     self.metrics["empty_moves"] += 1.0
                 vehicle.mode = MODE_REPOSITIONING
                 vehicle.remaining_steps = 1
                 efficiency_penalty += self.config.env.empty_move_penalty
-                vehicle.soc = max(0.0, vehicle.soc - self.config.env.move_consumption)
+                self._consume_reposition_energy(vehicle)
                 vehicle.assigned_station = target_station
-        elif action in (ACTION_MOVE_NORTH, ACTION_MOVE_SOUTH, ACTION_MOVE_EAST, ACTION_MOVE_WEST):
+        elif action in MOVE_ACTIONS:
             next_zone = self._move_zone(vehicle.zone, action)
             if next_zone != vehicle.zone:
                 vehicle.zone = next_zone
                 self.metrics["empty_moves"] += 1.0
             vehicle.mode = MODE_REPOSITIONING
             vehicle.remaining_steps = 1
-            vehicle.soc = max(0.0, vehicle.soc - self.config.env.move_consumption)
+            self._consume_reposition_energy(vehicle)
             efficiency_penalty += self.config.env.empty_move_penalty
         else:
             vehicle.idle_steps += 1
-            vehicle.soc = max(0.0, vehicle.soc - self.config.env.idle_consumption)
             efficiency_penalty += self.config.env.idle_penalty
 
         battery_penalty += self._battery_penalty(vehicle)
-        return self._compose_reward(profit, efficiency_penalty, battery_penalty)
+        death_penalty = self._kill_vehicle_if_needed(vehicle)
+        return self._compose_reward(profit, efficiency_penalty, battery_penalty) - death_penalty
+
     def _effective_charger_capacity(self) -> int:
         scaled = int(round(self.config.env.charger_capacity * self.current_charger_capacity_scale))
         return max(1, scaled)
@@ -602,9 +695,10 @@ class CometTaxiEnv:
 
         station_to_vehicles: dict[int, list[VehicleState]] = {zone: [] for zone in self.charge_stations}
         for vehicle in self.vehicles:
-            if vehicle.requested_charge and vehicle.zone in station_to_vehicles:
+            if vehicle.alive and vehicle.requested_charge and vehicle.zone in station_to_vehicles:
                 station_to_vehicles[vehicle.zone].append(vehicle)
 
+        charge_gain = self.config.env.charge_power_kw * (self.config.data.step_minutes / 60.0)
         for station_index, station_zone in enumerate(self.charge_stations):
             candidates = station_to_vehicles.get(station_zone, [])
             occupancy = min(len(candidates), capacity)
@@ -615,28 +709,35 @@ class CometTaxiEnv:
             for candidate_index, vehicle in enumerate(candidates):
                 if candidate_index < capacity:
                     vehicle.mode = MODE_CHARGING
-                    vehicle.soc = min(1.0, vehicle.soc + self.config.env.charge_rate_per_step)
+                    vehicle.battery_kwh = min(
+                        self.config.env.battery_capacity_kwh,
+                        vehicle.battery_kwh + charge_gain,
+                    )
                     self.metrics["charging_steps"] += 1.0
-                    if vehicle.soc >= 0.95:
+                    if self._battery_ratio(vehicle.battery_kwh) >= 0.95:
                         vehicle.mode = MODE_IDLE
                 else:
                     vehicle.mode = MODE_IDLE
                     vehicle.idle_steps += 1
         return overflow_cost
 
+    def _remove_dead_vehicles(self) -> None:
+        self.vehicles = [vehicle for vehicle in self.vehicles if vehicle.alive]
+
     def _build_costs(self) -> dict[str, float]:
         active_agents = max(float(len(self.vehicles)), 1.0)
         battery_cost = float(
-            sum(vehicle.soc < self.config.env.battery_low_threshold for vehicle in self.vehicles)
-        ) / active_agents
+            sum(
+                self._battery_ratio(vehicle.battery_kwh) < self.config.env.battery_low_threshold
+                for vehicle in self.vehicles
+            )
+            + self.metrics["dead_vehicles"]
+        ) / max(active_agents + self.metrics["dead_vehicles"], 1.0)
         charger_cost = float(self.charger_queue.sum()) / max(
             float(self._effective_charger_capacity() * max(len(self.charge_stations), 1)),
             1.0,
         )
-        service_cost = float(self.current_demand_vector.sum()) / max(
-            float(self.current_demand_vector.sum() + self.metrics["orders_served"]),
-            1.0,
-        )
+        service_cost = float(self.current_demand_vector.sum()) / max(self.current_orders_available, 1.0)
         costs = {
             "battery_violation_cost": battery_cost,
             "charger_overflow_cost": charger_cost,
@@ -672,20 +773,21 @@ class CometTaxiEnv:
             candidates.add(ACTION_ACCEPT_ORDER)
         if action_mask[ACTION_GO_CHARGE] > 0:
             candidates.add(ACTION_GO_CHARGE)
-        for action in (ACTION_MOVE_NORTH, ACTION_MOVE_SOUTH, ACTION_MOVE_EAST, ACTION_MOVE_WEST):
+        zone = int(observation["local_obs"][slot, 0]) - 1
+        for action in MOVE_ACTIONS:
             if action_mask[action] > 0:
                 candidates.add(action)
-        zone = int(observation["local_obs"][slot, 0]) - 1
         ranked_zones = observation["ranked_demand_zones"][:top_k]
         for target_zone in ranked_zones:
-            if int(target_zone) == zone:
+            target_zone = int(target_zone)
+            if target_zone == zone:
                 candidates.add(ACTION_STAY)
-            else:
-                next_zone = self._step_toward_zone(zone, int(target_zone))
-                for action in (ACTION_MOVE_NORTH, ACTION_MOVE_SOUTH, ACTION_MOVE_EAST, ACTION_MOVE_WEST):
-                    if action_mask[action] > 0 and self._move_zone(zone, action) == next_zone:
-                        candidates.add(action)
-                        break
+                continue
+            next_zone = self._step_toward_zone(zone, target_zone)
+            for action in MOVE_ACTIONS:
+                if action_mask[action] > 0 and self._move_zone(zone, action) == next_zone:
+                    candidates.add(action)
+                    break
         return sorted(candidates)
 
     def generate_candidate_actions(
@@ -697,6 +799,7 @@ class CometTaxiEnv:
             self.generate_candidate_actions_for_slot(observation, slot, top_k)
             for slot in range(self.config.env.nmax)
         ]
+
     def step(
         self, actions: np.ndarray | list[int]
     ) -> tuple[dict[str, np.ndarray], np.ndarray, float, bool, dict[str, Any]]:
@@ -711,6 +814,8 @@ class CometTaxiEnv:
 
         per_agent_rewards = np.zeros(self.config.env.nmax, dtype=np.float32)
         for slot_index, vehicle_index in enumerate(self.slot_to_vehicle):
+            if vehicle_index >= len(self.vehicles):
+                continue
             vehicle = self.vehicles[vehicle_index]
             valid_mask = self._action_mask_for_vehicle(vehicle)
             chosen_action = int(action_array[slot_index])
@@ -724,6 +829,7 @@ class CometTaxiEnv:
             per_agent_rewards[slot_index] = reward
 
         overflow_penalty = self._apply_charger_allocation()
+        self._remove_dead_vehicles()
         costs = self._build_costs()
         costs["charger_overflow_cost"] += overflow_penalty
         self.metrics["charger_overflow_cost_sum"] += overflow_penalty
@@ -743,10 +849,12 @@ class CometTaxiEnv:
         }
 
         self.current_step += 1
-        self.done = self.current_step >= self.episode_steps
+        self.current_bin_index = self.start_bin + self.current_step
+        self.done = self.current_step >= self.episode_steps or len(self.vehicles) == 0
 
         if self.done:
             self.current_demand_vector = np.zeros(self.cell_count, dtype=np.float32)
+            self.current_orders_available = 0.0
             self._update_temporal_history()
             next_observation = self._build_observation()
         else:
@@ -761,18 +869,18 @@ class CometTaxiEnv:
 
     def _build_info(self, costs: dict[str, float]) -> dict[str, Any]:
         orders_available = max(self.metrics["orders_available"], 1.0)
-        real_vehicle_count = max(float(len(self.vehicles)), 1.0)
+        initial_vehicle_count = max(float(self.metrics["initial_agents"]), 1.0)
         charge_need_steps = max(self.metrics["charge_need_steps"], 1.0)
         real_agent_steps = max(self.metrics["real_agent_steps"], 1.0)
         planner_steps = max(self.metrics["planner_steps"], 1.0)
+        battery_violation_events = self.metrics["low_battery_violations"] + self.metrics["dead_vehicles"]
         return {
             "order_completion_rate": self.metrics["orders_served"] / orders_available,
-            "average_profit_per_vehicle": self.metrics["profit_total"] / real_vehicle_count,
+            "average_profit_per_vehicle": self.metrics["profit_total"] / initial_vehicle_count,
             "empty_travel_ratio": self.metrics["empty_moves"] / max(
                 self.metrics["empty_moves"] + self.metrics["orders_served"], 1.0
             ),
-            "battery_safety_rate": 1.0
-            - self.metrics["low_battery_violations"] / real_agent_steps,
+            "battery_safety_rate": 1.0 - battery_violation_events / real_agent_steps,
             "charging_efficiency": self.metrics["charge_response_steps"] / charge_need_steps,
             "mean_team_reward": self.metrics["team_reward_sum"] / max(self.metrics["episode_steps"], 1.0),
             "orders_available": self.metrics["orders_available"],

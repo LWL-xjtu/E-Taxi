@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,9 +10,19 @@ import pandas as pd
 from .config import DataConfig
 from .utils import dump_json, ensure_dir, load_json
 
-PICKUP_TIME_CANDIDATES = ["tpep_pickup_datetime", "pickup_datetime"]
-DROPOFF_TIME_CANDIDATES = ["tpep_dropoff_datetime", "dropoff_datetime"]
-FARE_CANDIDATES = ["total_amount", "fare_amount"]
+PICKUP_TIME_CANDIDATES = [
+    "tpep_pickup_datetime",
+    "pickup_datetime",
+    "lpep_pickup_datetime",
+]
+DROPOFF_TIME_CANDIDATES = [
+    "tpep_dropoff_datetime",
+    "dropoff_datetime",
+    "lpep_dropoff_datetime",
+]
+FARE_CANDIDATES = ["fare_amount", "fare"]
+REVENUE_CANDIDATES = ["total_amount", "fare_amount", "fare"]
+DISTANCE_CANDIDATES = ["trip_distance", "distance"]
 COORDINATE_COLUMNS = [
     "pickup_longitude",
     "pickup_latitude",
@@ -20,6 +30,9 @@ COORDINATE_COLUMNS = [
     "dropoff_latitude",
 ]
 LOCATION_ID_COLUMNS = ["PULocationID", "DOLocationID"]
+MILES_TO_KM = 1.60934
+MAX_TLC_LOCATION_ID = 263
+ACTIONS_PER_ZONE = 4
 
 
 @dataclass(slots=True)
@@ -37,8 +50,28 @@ class PreparedDataset:
             for split in ("train", "val", "test")
         }
         for frame in splits.values():
-            frame["time_bin"] = pd.to_datetime(frame["time_bin"], utc=False)
+            if "time_bin" in frame.columns:
+                frame["time_bin"] = pd.to_datetime(frame["time_bin"], utc=False)
         return cls(root=dataset_root, metadata=metadata, splits=splits)
+
+    def get_day_orders(self, date: str | pd.Timestamp, split: str = "train") -> pd.DataFrame:
+        target_date = pd.Timestamp(date).date().isoformat()
+        frame = self.splits[split]
+        return frame[frame["service_date"] == target_date].copy().reset_index(drop=True)
+
+    def get_orders_for_day_and_bin(
+        self,
+        date: str | pd.Timestamp,
+        time_bin: int | str | pd.Timestamp,
+        split: str = "train",
+    ) -> pd.DataFrame:
+        day_orders = self.get_day_orders(date=date, split=split)
+        if isinstance(time_bin, (int, np.integer)):
+            bin_index = int(time_bin)
+        else:
+            timestamp = pd.Timestamp(time_bin)
+            bin_index = int(timestamp.hour * 60 // self.metadata["data"]["step_minutes"] + timestamp.minute // self.metadata["data"]["step_minutes"])
+        return day_orders[day_orders["time_bin_index"] == bin_index].copy().reset_index(drop=True)
 
 
 @dataclass(slots=True)
@@ -63,50 +96,18 @@ def _pick_first_existing(columns: list[str], frame: pd.DataFrame) -> str:
         if column in frame.columns:
             return column
     joined = ", ".join(columns)
-    raise ValueError(f"Missing required columns. Expected one of: {joined}")
-
-
-def _canonicalize_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    pickup_time = _pick_first_existing(PICKUP_TIME_CANDIDATES, frame)
-    dropoff_time = _pick_first_existing(DROPOFF_TIME_CANDIDATES, frame)
-    fare = _pick_first_existing(FARE_CANDIDATES, frame)
-
-    canonical = pd.DataFrame(
-        {
-            "pickup_datetime": pd.to_datetime(frame[pickup_time]),
-            "dropoff_datetime": pd.to_datetime(frame[dropoff_time]),
-            "mean_fare": pd.to_numeric(frame[fare], errors="coerce"),
-        }
+    present = ", ".join(sorted(str(column) for column in frame.columns))
+    raise ValueError(
+        f"Missing required columns. Expected one of: {joined}. Present columns: {present}"
     )
 
-    has_coordinates = all(column in frame.columns for column in COORDINATE_COLUMNS)
-    has_location_ids = all(column in frame.columns for column in LOCATION_ID_COLUMNS)
 
-    if has_coordinates:
-        for column in COORDINATE_COLUMNS:
-            canonical[column] = pd.to_numeric(frame[column], errors="coerce")
-        canonical["mapping_mode"] = "coordinates"
-    elif has_location_ids:
-        canonical["pickup_location_id"] = pd.to_numeric(
-            frame["PULocationID"], errors="coerce"
-        ).astype("Int64")
-        canonical["dropoff_location_id"] = pd.to_numeric(
-            frame["DOLocationID"], errors="coerce"
-        ).astype("Int64")
-        canonical["mapping_mode"] = "location_id_projection"
-    else:
-        raise ValueError(
-            "The input parquet must contain either coordinate columns or PULocationID/"
-            "DOLocationID columns."
-        )
-
-    canonical["trip_minutes"] = (
-        canonical["dropoff_datetime"] - canonical["pickup_datetime"]
-    ).dt.total_seconds() / 60.0
-    canonical = canonical.dropna(subset=["pickup_datetime", "dropoff_datetime", "mean_fare"])
-    canonical = canonical[canonical["trip_minutes"] > 0]
-    canonical = canonical[canonical["mean_fare"] >= 0]
-    return canonical.reset_index(drop=True)
+def _build_charge_price_proxy(time_bin_index: pd.Series) -> np.ndarray:
+    fraction = time_bin_index.to_numpy(dtype=np.float32) / 144.0
+    morning_peak = ((time_bin_index >= 42) & (time_bin_index <= 60)).to_numpy(dtype=np.float32)
+    evening_peak = ((time_bin_index >= 96) & (time_bin_index <= 114)).to_numpy(dtype=np.float32)
+    curve = 0.92 + 0.10 * np.sin(2.0 * np.pi * (fraction - 0.15))
+    return (curve + 0.12 * (morning_peak + evening_peak)).astype(np.float32)
 
 
 def _grid_from_coordinates(frame: pd.DataFrame, config: DataConfig) -> tuple[pd.Series, pd.Series, dict[str, Any]]:
@@ -128,7 +129,7 @@ def _grid_from_coordinates(frame: pd.DataFrame, config: DataConfig) -> tuple[pd.
     pickup_cells = encode(frame["pickup_longitude"], frame["pickup_latitude"])
     dropoff_cells = encode(frame["dropoff_longitude"], frame["dropoff_latitude"])
     metadata = {
-        "mapping_mode": "coordinates",
+        "zone_mode": "grid",
         "coordinate_bounds": {
             "min_lon": float(min_lon),
             "max_lon": float(max_lon),
@@ -139,81 +140,172 @@ def _grid_from_coordinates(frame: pd.DataFrame, config: DataConfig) -> tuple[pd.
     return pickup_cells, dropoff_cells, metadata
 
 
-def _grid_from_location_ids(
-    frame: pd.DataFrame, config: DataConfig
-) -> tuple[pd.Series, pd.Series, dict[str, Any]]:
-    location_ids = pd.concat(
-        [frame["pickup_location_id"], frame["dropoff_location_id"]]
-    ).dropna()
-    unique_ids = sorted(int(value) for value in location_ids.unique())
-    if not unique_ids:
-        raise ValueError("No usable PULocationID/DOLocationID values were found.")
+def _canonicalize_orders(frame: pd.DataFrame, config: DataConfig) -> tuple[pd.DataFrame, dict[str, Any]]:
+    pickup_time = _pick_first_existing(PICKUP_TIME_CANDIDATES, frame)
+    dropoff_time = _pick_first_existing(DROPOFF_TIME_CANDIDATES, frame)
+    fare_column = _pick_first_existing(FARE_CANDIDATES, frame)
+    revenue_column = _pick_first_existing(REVENUE_CANDIDATES, frame)
+    distance_column = _pick_first_existing(DISTANCE_CANDIDATES, frame)
 
-    mapping: dict[int, int] = {}
-    total = len(unique_ids)
-    for rank, location_id in enumerate(unique_ids):
-        cell = int(np.floor(rank / max(total, 1) * config.cell_count))
-        mapping[location_id] = min(cell, config.cell_count - 1)
+    canonical = pd.DataFrame(
+        {
+            "pickup_datetime": pd.to_datetime(frame[pickup_time], errors="coerce"),
+            "dropoff_datetime": pd.to_datetime(frame[dropoff_time], errors="coerce"),
+            "fare_amount": pd.to_numeric(frame[fare_column], errors="coerce"),
+            "revenue_amount": pd.to_numeric(frame[revenue_column], errors="coerce"),
+            "trip_distance_miles": pd.to_numeric(frame[distance_column], errors="coerce"),
+        }
+    )
 
-    pickup_cells = frame["pickup_location_id"].fillna(unique_ids[0]).astype(int).map(mapping)
-    dropoff_cells = frame["dropoff_location_id"].fillna(unique_ids[0]).astype(int).map(mapping)
-    metadata = {
-        "mapping_mode": "location_id_projection",
-        "location_id_to_cell": {str(key): value for key, value in mapping.items()},
-    }
-    return pickup_cells.astype(int), dropoff_cells.astype(int), metadata
-
-
-def _assign_grid_cells(frame: pd.DataFrame, config: DataConfig) -> tuple[pd.DataFrame, dict[str, Any]]:
-    if frame["mapping_mode"].iloc[0] == "coordinates":
-        pickup_cells, dropoff_cells, metadata = _grid_from_coordinates(frame, config)
+    mapping_metadata: dict[str, Any]
+    if all(column in frame.columns for column in LOCATION_ID_COLUMNS):
+        canonical["pickup_location_id"] = pd.to_numeric(frame["PULocationID"], errors="coerce")
+        canonical["dropoff_location_id"] = pd.to_numeric(frame["DOLocationID"], errors="coerce")
+        canonical = canonical.dropna(
+            subset=[
+                "pickup_datetime",
+                "dropoff_datetime",
+                "fare_amount",
+                "revenue_amount",
+                "trip_distance_miles",
+                "pickup_location_id",
+                "dropoff_location_id",
+            ]
+        )
+        canonical["pickup_location_id"] = canonical["pickup_location_id"].astype(int)
+        canonical["dropoff_location_id"] = canonical["dropoff_location_id"].astype(int)
+        canonical = canonical[
+            canonical["pickup_location_id"].between(1, MAX_TLC_LOCATION_ID)
+            & canonical["dropoff_location_id"].between(1, MAX_TLC_LOCATION_ID)
+        ]
+        canonical["pickup_cell"] = canonical["pickup_location_id"] - 1
+        canonical["dropoff_cell"] = canonical["dropoff_location_id"] - 1
+        mapping_metadata = {
+            "zone_mode": "tlc_location_id",
+            "location_id_to_cell": {
+                str(location_id): int(location_id - 1)
+                for location_id in range(1, MAX_TLC_LOCATION_ID + 1)
+            },
+            "cell_to_location_id": {
+                str(cell): int(cell + 1) for cell in range(MAX_TLC_LOCATION_ID)
+            },
+        }
+    elif all(column in frame.columns for column in COORDINATE_COLUMNS) and config.zone_mode == "grid":
+        for column in COORDINATE_COLUMNS:
+            canonical[column] = pd.to_numeric(frame[column], errors="coerce")
+        canonical = canonical.dropna(
+            subset=[
+                "pickup_datetime",
+                "dropoff_datetime",
+                "fare_amount",
+                "revenue_amount",
+                "trip_distance_miles",
+                *COORDINATE_COLUMNS,
+            ]
+        )
+        pickup_cells, dropoff_cells, mapping_metadata = _grid_from_coordinates(canonical, config)
+        canonical["pickup_location_id"] = pickup_cells + 1
+        canonical["dropoff_location_id"] = dropoff_cells + 1
+        canonical["pickup_cell"] = pickup_cells
+        canonical["dropoff_cell"] = dropoff_cells
     else:
-        pickup_cells, dropoff_cells, metadata = _grid_from_location_ids(frame, config)
-
-    enriched = frame.copy()
-    enriched["pickup_cell"] = pickup_cells
-    enriched["dropoff_cell"] = dropoff_cells
-    return enriched, metadata
-
-
-def _select_small_sample(frame: pd.DataFrame, config: DataConfig) -> pd.DataFrame:
-    working = frame.copy()
-    working["service_date"] = working["pickup_datetime"].dt.date.astype(str)
-    unique_days = sorted(working["service_date"].unique())
-    selected_days = unique_days[: config.use_first_n_days]
-    working = working[working["service_date"].isin(selected_days)].copy()
-    working["hour"] = working["pickup_datetime"].dt.hour
-    working = working[
-        (working["hour"] >= config.start_hour) & (working["hour"] < config.end_hour)
-    ]
-    working["time_bin"] = working["pickup_datetime"].dt.floor(f"{config.step_minutes}min")
-    return working.reset_index(drop=True)
-
-
-def _aggregate(frame: pd.DataFrame) -> pd.DataFrame:
-    grouped = (
-        frame.groupby(
-            ["service_date", "time_bin", "pickup_cell", "dropoff_cell"], as_index=False
+        present = ", ".join(sorted(str(column) for column in frame.columns))
+        raise ValueError(
+            "The input parquet must contain TLC location columns PULocationID/DOLocationID "
+            "or coordinate columns for grid mode. Present columns: "
+            f"{present}"
         )
-        .agg(
-            demand_count=("pickup_cell", "size"),
-            mean_trip_minutes=("trip_minutes", "mean"),
-            mean_fare=("mean_fare", "mean"),
-        )
-        .sort_values(["service_date", "time_bin", "pickup_cell", "dropoff_cell"])
-        .reset_index(drop=True)
-    )
-    hour_progress = (
-        grouped["time_bin"].dt.hour
-        + grouped["time_bin"].dt.minute / 60.0
-        - grouped["time_bin"].dt.hour.min()
-    )
-    grouped["charge_price"] = 0.9 + 0.2 * np.sin(hour_progress / 3.0)
-    global_trip_mean = max(float(grouped["mean_trip_minutes"].mean()), 1e-6)
-    grouped["travel_time_residual"] = (
-        grouped["mean_trip_minutes"] - global_trip_mean
+
+    canonical["trip_minutes"] = (
+        canonical["dropoff_datetime"] - canonical["pickup_datetime"]
+    ).dt.total_seconds() / 60.0
+    canonical = canonical[
+        (canonical["dropoff_datetime"] > canonical["pickup_datetime"])
+        & (canonical["fare_amount"] > 0)
+        & (canonical["trip_distance_miles"] > 0)
+        & (canonical["revenue_amount"] > 0)
+    ].copy()
+
+    canonical["trip_distance_km"] = canonical["trip_distance_miles"] * MILES_TO_KM
+    canonical["service_date"] = canonical["pickup_datetime"].dt.date.astype(str)
+    canonical["time_bin"] = canonical["pickup_datetime"].dt.floor(f"{config.step_minutes}min")
+    canonical["time_bin_index"] = (
+        canonical["pickup_datetime"].dt.hour * (60 // config.step_minutes)
+        + canonical["pickup_datetime"].dt.minute // config.step_minutes
+    ).astype(int)
+    canonical["hour"] = canonical["pickup_datetime"].dt.hour.astype(int)
+
+    selected_days = sorted(canonical["service_date"].unique())[: config.use_first_n_days]
+    canonical = canonical[canonical["service_date"].isin(selected_days)].copy()
+    start_bin = int(config.start_hour * 60 / config.step_minutes)
+    end_bin = int(config.end_hour * 60 / config.step_minutes)
+    canonical = canonical[
+        (canonical["time_bin_index"] >= start_bin)
+        & (canonical["time_bin_index"] < end_bin)
+    ].copy()
+
+    canonical["charge_price"] = _build_charge_price_proxy(canonical["time_bin_index"])
+    global_trip_mean = max(float(canonical["trip_minutes"].mean()), 1e-6)
+    canonical["travel_time_residual"] = (
+        canonical["trip_minutes"] - global_trip_mean
     ) / global_trip_mean
-    return grouped
+
+    keep_columns = [
+        "service_date",
+        "time_bin",
+        "time_bin_index",
+        "pickup_datetime",
+        "dropoff_datetime",
+        "pickup_location_id",
+        "dropoff_location_id",
+        "pickup_cell",
+        "dropoff_cell",
+        "trip_distance_miles",
+        "trip_distance_km",
+        "trip_minutes",
+        "fare_amount",
+        "revenue_amount",
+        "charge_price",
+        "travel_time_residual",
+    ]
+    canonical = canonical[keep_columns].sort_values(
+        ["service_date", "time_bin_index", "pickup_datetime", "pickup_cell", "dropoff_cell"]
+    )
+    return canonical.reset_index(drop=True), mapping_metadata
+
+
+def _build_zone_neighbors(train_frame: pd.DataFrame, cell_count: int) -> dict[str, list[int]]:
+    od_counts = (
+        train_frame.groupby(["pickup_cell", "dropoff_cell"], as_index=False)
+        .size()
+        .sort_values(["pickup_cell", "size"], ascending=[True, False])
+    )
+    by_zone: dict[int, list[int]] = {zone: [] for zone in range(cell_count)}
+    for record in od_counts.to_dict("records"):
+        pickup_zone = int(record["pickup_cell"])
+        dropoff_zone = int(record["dropoff_cell"])
+        if dropoff_zone == pickup_zone:
+            continue
+        candidates = by_zone[pickup_zone]
+        if dropoff_zone not in candidates:
+            candidates.append(dropoff_zone)
+
+    demand_rank = (
+        train_frame.groupby("pickup_cell").size().sort_values(ascending=False).index.astype(int).tolist()
+    )
+    for zone in range(cell_count):
+        candidates = by_zone[zone]
+        for fallback_zone in demand_rank:
+            if fallback_zone != zone and fallback_zone not in candidates:
+                candidates.append(int(fallback_zone))
+            if len(candidates) >= ACTIONS_PER_ZONE:
+                break
+        if not candidates:
+            candidates.append(zone)
+        while len(candidates) < ACTIONS_PER_ZONE:
+            candidates.append(candidates[-1])
+        by_zone[zone] = candidates[:ACTIONS_PER_ZONE]
+    return {str(zone): neighbors for zone, neighbors in by_zone.items()}
 
 
 def _build_metadata(
@@ -224,34 +316,38 @@ def _build_metadata(
     charge_station_count: int,
 ) -> dict[str, Any]:
     train_frame = split_frames["train"]
+    cell_count = int(config.cell_count if config.zone_mode == "grid" else MAX_TLC_LOCATION_ID)
     demand_totals = (
-        train_frame.groupby("pickup_cell")["demand_count"].sum().reindex(
-            range(config.cell_count), fill_value=0
-        )
+        train_frame.groupby("pickup_cell").size().reindex(range(cell_count), fill_value=0)
     )
-    demand_priors = (
-        demand_totals / max(float(demand_totals.sum()), 1.0)
-    ).round(8)
+    demand_priors = (demand_totals / max(float(demand_totals.sum()), 1.0)).round(8)
     charge_stations = (
         demand_totals.sort_values(ascending=False)
-        .head(min(charge_station_count, config.cell_count))
+        .head(min(charge_station_count, cell_count))
         .index.astype(int)
         .tolist()
     )
+    zone_neighbors = _build_zone_neighbors(train_frame, cell_count)
     split_dates = {
-        split: sorted(frame["service_date"].unique().tolist()) for split, frame in split_frames.items()
+        split: sorted(frame["service_date"].unique().tolist())
+        for split, frame in split_frames.items()
     }
     od_summary = (
-        train_frame.groupby(["pickup_cell", "dropoff_cell"])["mean_trip_minutes"]
-        .mean()
-        .reset_index()
+        train_frame.groupby(["pickup_cell", "dropoff_cell"], as_index=False)
+        .agg(
+            order_count=("pickup_cell", "size"),
+            mean_trip_minutes=("trip_minutes", "mean"),
+            mean_trip_distance_km=("trip_distance_km", "mean"),
+            mean_revenue_amount=("revenue_amount", "mean"),
+        )
+        .sort_values("order_count", ascending=False)
+        .head(4096)
         .to_dict("records")
     )
     demand_summary = (
-        train_frame.groupby(["pickup_cell", "time_bin"])["demand_count"]
-        .sum()
-        .reset_index()
-        .assign(time_bin=lambda frame: frame["time_bin"].astype(str))
+        train_frame.groupby(["pickup_cell", "time_bin_index"], as_index=False)
+        .size()
+        .rename(columns={"size": "order_count"})
         .to_dict("records")
     )
     charge_price_summary = {
@@ -260,26 +356,51 @@ def _build_metadata(
         "min": float(train_frame["charge_price"].min()),
         "max": float(train_frame["charge_price"].max()),
     }
+    trip_duration_summary = {
+        "mean": float(processed["trip_minutes"].mean()),
+        "std": float(processed["trip_minutes"].std(ddof=0) or 0.0),
+        "p50": float(processed["trip_minutes"].quantile(0.5)),
+        "p90": float(processed["trip_minutes"].quantile(0.9)),
+    }
+    trip_distance_summary = {
+        "mean_km": float(processed["trip_distance_km"].mean()),
+        "std_km": float(processed["trip_distance_km"].std(ddof=0) or 0.0),
+        "p50_km": float(processed["trip_distance_km"].quantile(0.5)),
+        "p90_km": float(processed["trip_distance_km"].quantile(0.9)),
+    }
+    fare_summary = {
+        "mean_fare_amount": float(processed["fare_amount"].mean()),
+        "mean_revenue_amount": float(processed["revenue_amount"].mean()),
+        "std_revenue_amount": float(processed["revenue_amount"].std(ddof=0) or 0.0),
+    }
+    mapping_metadata["zone_neighbors"] = zone_neighbors
     return {
         "data": {
+            "zone_mode": mapping_metadata.get("zone_mode", config.zone_mode),
             "grid_rows": config.grid_rows,
             "grid_cols": config.grid_cols,
-            "cell_count": config.cell_count,
+            "cell_count": cell_count,
             "step_minutes": config.step_minutes,
             "start_hour": config.start_hour,
             "end_hour": config.end_hour,
             "episode_steps": config.episode_steps,
+            "time_bins_per_day": config.time_bins_per_day,
         },
         "splits": split_dates,
         "charge_stations": charge_stations,
         "zone_demand_priors": demand_priors.tolist(),
         "global_defaults": {
             "mean_trip_minutes": float(processed["trip_minutes"].mean()),
-            "mean_fare": float(processed["mean_fare"].mean()),
+            "mean_fare": float(processed["revenue_amount"].mean()),
+            "mean_trip_distance_km": float(processed["trip_distance_km"].mean()),
+            "mean_charge_price": float(processed["charge_price"].mean()),
         },
         "calibration": {
             "od_travel_time_summary": od_summary,
             "demand_per_zone_time_summary": demand_summary,
+            "trip_distance_summary": trip_distance_summary,
+            "trip_duration_summary": trip_duration_summary,
+            "fare_summary": fare_summary,
             "charge_price_summary": charge_price_summary,
             "charger_metadata_placeholder": [
                 {
@@ -289,6 +410,10 @@ def _build_metadata(
                 }
                 for zone in charge_stations
             ],
+            "notes": {
+                "charge_price": "NYC TLC does not include electricity prices. The project uses a time-of-day proxy for charging cost.",
+                "reposition_graph": "For TLC zone mode, move actions are mapped to four data-driven neighboring zones derived from historical OD transitions.",
+            },
         },
         "mapping": mapping_metadata,
     }
@@ -301,9 +426,7 @@ def prepare_nyc_dataset(
     charge_station_count: int = 5,
 ) -> PreparedDataset:
     source = pd.read_parquet(input_path)
-    canonical = _canonicalize_columns(source)
-    canonical = _select_small_sample(canonical, config)
-    processed, mapping_metadata = _assign_grid_cells(canonical, config)
+    processed, mapping_metadata = _canonicalize_orders(source, config)
 
     selected_days = sorted(processed["service_date"].unique())
     expected_days = config.train_days + config.val_days + config.test_days
@@ -319,10 +442,8 @@ def prepare_nyc_dataset(
             config.train_days + config.val_days : config.train_days + config.val_days + config.test_days
         ],
     }
-
-    aggregated = _aggregate(processed)
     split_frames = {
-        split: aggregated[aggregated["service_date"].isin(days)].copy().reset_index(drop=True)
+        split: processed[processed["service_date"].isin(days)].copy().reset_index(drop=True)
         for split, days in split_dates.items()
     }
 
@@ -344,7 +465,7 @@ def prepare_nyc_dataset(
 def fit_normalization_statistics(dataset: PreparedDataset) -> dict[str, list[float] | float]:
     train_frame = dataset.splits["train"].copy()
     demand_series = (
-        train_frame.groupby("pickup_cell")["demand_count"].sum().reindex(
+        train_frame.groupby("pickup_cell").size().reindex(
             range(dataset.metadata["data"]["cell_count"]),
             fill_value=0.0,
         )
@@ -357,6 +478,10 @@ def fit_normalization_statistics(dataset: PreparedDataset) -> dict[str, list[flo
         "charge_price_std": float(temporal_scalars[:, 0].std() or 1.0),
         "travel_time_residual_mean": float(temporal_scalars[:, 1].mean()),
         "travel_time_residual_std": float(temporal_scalars[:, 1].std() or 1.0),
+        "trip_distance_km_mean": float(train_frame["trip_distance_km"].mean()),
+        "trip_distance_km_std": float(train_frame["trip_distance_km"].std(ddof=0) or 1.0),
+        "trip_minutes_mean": float(train_frame["trip_minutes"].mean()),
+        "trip_minutes_std": float(train_frame["trip_minutes"].std(ddof=0) or 1.0),
     }
 
 
@@ -395,13 +520,11 @@ def export_offline_transition_dataset(
 
     for _ in range(episode_count):
         observation = env.reset("train")
-        episode_indices: list[int] = []
         episode_rewards: list[float] = []
         done = False
         while not done:
             action = policy.act(observation)
             next_observation, _, team_reward, done, info = env.step(action)
-            episode_indices.append(len(rewards))
             episode_rewards.append(team_reward)
             local_obs.append(observation["local_obs"])
             fleet_signature.append(observation["fleet_signature"])
@@ -412,7 +535,14 @@ def export_offline_transition_dataset(
             rewards.append(team_reward)
             dones.append(float(done))
             cost_vectors.append(
-                np.asarray([info["costs"][name] for name in ("battery_violation_cost", "charger_overflow_cost", "service_violation_cost")], dtype=np.float32)
+                np.asarray(
+                    [
+                        info["costs"]["battery_violation_cost"],
+                        info["costs"]["charger_overflow_cost"],
+                        info["costs"]["service_violation_cost"],
+                    ],
+                    dtype=np.float32,
+                )
             )
             next_local_obs.append(next_observation["local_obs"])
             next_fleet_signature.append(next_observation["fleet_signature"])
@@ -421,7 +551,9 @@ def export_offline_transition_dataset(
             next_action_mask.append(next_observation["action_mask"])
             aux_next_demand.append(info["aux_targets"]["next_demand"])
             aux_charger_occupancy.append(info["aux_targets"]["charger_occupancy"])
-            aux_travel_residual.append(np.asarray([info["aux_targets"]["travel_time_residual"]], dtype=np.float32))
+            aux_travel_residual.append(
+                np.asarray([info["aux_targets"]["travel_time_residual"]], dtype=np.float32)
+            )
             observation = next_observation
 
         running_return = 0.0

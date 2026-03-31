@@ -33,18 +33,21 @@ class CandidatePlanner:
         logits_row: np.ndarray,
         value_mean: float,
         cost_means: np.ndarray,
+        uncertainty_value: float,
     ) -> float:
         demand_vector = observation.get("demand_vector")
         zone = int(observation["local_obs"][slot, 0]) - 1
         soc = float(observation["local_obs"][slot, 4])
-        score = float(logits_row[action]) + 0.1 * value_mean
+        score = self.config.planner.actor_prior_weight * float(logits_row[action])
+        score += self.config.planner.value_weight * float(value_mean)
         if action == ACTION_ACCEPT_ORDER and demand_vector is not None and zone >= 0:
             score += 1.0 + float(demand_vector[zone])
         if action == ACTION_GO_CHARGE:
             score += 0.5 if soc < self.config.planner.risk_trigger_soc else -0.1
         if action == ACTION_STAY and demand_vector is not None and zone >= 0:
             score += 0.1 * float(demand_vector[zone])
-        score -= 0.5 * float(cost_means.sum())
+        score -= self.config.planner.cost_penalty_weight * float(cost_means.sum())
+        score -= self.config.planner.uncertainty_penalty_weight * float(uncertainty_value)
         return score
 
     def select_actions(
@@ -109,6 +112,7 @@ class CandidatePlanner:
                                 masked_logits,
                                 value_mean,
                                 cost_means,
+                                uncertainty_value,
                             ),
                             action,
                         )

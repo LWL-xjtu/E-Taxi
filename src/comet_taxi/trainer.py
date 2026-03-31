@@ -44,7 +44,7 @@ class CometTrainer:
         self.device = resolve_device(config.train.device)
         self.dims = infer_model_dimensions(
             self.dataset.metadata["data"]["cell_count"],
-            charger_count=config.env.charge_station_count,
+            charger_count=len(self.dataset.metadata["charge_stations"]),
             history_len=config.temporal.history_len,
         )
         self.legacy_mode = config.model.variant == "legacy"

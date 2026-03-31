@@ -1,9 +1,11 @@
 [data]
 grid_rows = 8
 grid_cols = 8
+zone_mode = "tlc_location_id"
+zone_count_override = 263
 step_minutes = 10
-start_hour = 8
-end_hour = 20
+start_hour = 0
+end_hour = 24
 use_first_n_days = 7
 train_days = 5
 val_days = 1
@@ -132,6 +134,10 @@ use_short_horizon_rollout = false
 fallback_policy = "greedy"
 risk_trigger_soc = 0.18
 planner_mode = "planner"
+actor_prior_weight = 1.0
+value_weight = 0.1
+cost_penalty_weight = 0.5
+uncertainty_penalty_weight = 0.25
 
 [evaluation]
 standard_episodes = 1

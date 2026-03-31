@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from copy import deepcopy
 
 import torch
 
@@ -32,7 +33,7 @@ def _build_dims(tmp_path: Path):
     dataset = PreparedDataset.load(output_dir)
     dims = infer_model_dimensions(
         dataset.metadata["data"]["cell_count"],
-        charger_count=config.env.charge_station_count,
+        charger_count=len(dataset.metadata["charge_stations"]),
         history_len=config.temporal.history_len,
     )
     return config, dims
@@ -99,6 +100,70 @@ def test_set_encoder_is_permutation_invariant(tmp_path: Path) -> None:
     permuted = set_encoder(permuted_tokens, permuted_mask, fleet_signature)
 
     assert torch.allclose(original, permuted, atol=1e-5)
+
+
+def test_set_transformer_mode_runs_with_ghosts(tmp_path: Path) -> None:
+    config, dims = _build_dims(tmp_path)
+    config = deepcopy(config)
+    config.set_encoder.type = "set_transformer"
+    actor = COMETActorV2(config.model, config.set_encoder, config.temporal, dims)
+    local_obs = torch.zeros(1, config.env.nmax, dims.local_dim)
+    fleet_signature = torch.zeros(1, dims.fleet_signature_dim)
+    temporal_history = torch.zeros(1, config.temporal.history_len, dims.temporal_feature_dim)
+    agent_mask = torch.zeros(1, config.env.nmax)
+    agent_mask[:, :10] = 1.0
+    action_mask = torch.ones(1, config.env.nmax, dims.action_dim)
+
+    output = actor(
+        {
+            "local_obs": local_obs,
+            "fleet_signature": fleet_signature,
+            "temporal_history": temporal_history,
+            "agent_mask": agent_mask,
+            "action_mask": action_mask,
+        }
+    )
+    assert output.logits.shape == (1, config.env.nmax, dims.action_dim)
+
+
+def test_variable_active_agent_counts_forward(tmp_path: Path) -> None:
+    config, dims = _build_dims(tmp_path)
+    actor = COMETActorV2(config.model, config.set_encoder, config.temporal, dims)
+    for active_agents in (10, 15):
+        local_obs = torch.zeros(1, config.env.nmax, dims.local_dim)
+        fleet_signature = torch.zeros(1, dims.fleet_signature_dim)
+        temporal_history = torch.zeros(1, config.temporal.history_len, dims.temporal_feature_dim)
+        agent_mask = torch.zeros(1, config.env.nmax)
+        agent_mask[:, :active_agents] = 1.0
+        action_mask = torch.ones(1, config.env.nmax, dims.action_dim)
+        output = actor(
+            {
+                "local_obs": local_obs,
+                "fleet_signature": fleet_signature,
+                "temporal_history": temporal_history,
+                "agent_mask": agent_mask,
+                "action_mask": action_mask,
+            }
+        )
+        assert output.logits.shape == (1, config.env.nmax, dims.action_dim)
+
+
+def test_ghost_mask_blocks_fleet_pollution(tmp_path: Path) -> None:
+    config, dims = _build_dims(tmp_path)
+    token_encoder = VehicleTokenEncoder(config.model, dims)
+    set_encoder = FleetSetEncoder(config.set_encoder, config.model, dims)
+    clean_local_obs = torch.zeros(1, config.env.nmax, dims.local_dim)
+    clean_local_obs[0, :10, 0] = 1.0
+    noisy_local_obs = clean_local_obs.clone()
+    noisy_local_obs[0, 10:, 4] = 99.0
+    agent_mask = torch.zeros(1, config.env.nmax)
+    agent_mask[0, :10] = 1.0
+    fleet_signature = torch.zeros(1, dims.fleet_signature_dim)
+    clean_tokens = token_encoder(clean_local_obs)
+    noisy_tokens = token_encoder(noisy_local_obs)
+    clean_context = set_encoder(clean_tokens, agent_mask, fleet_signature)
+    noisy_context = set_encoder(noisy_tokens, agent_mask, fleet_signature)
+    assert torch.allclose(clean_context, noisy_context, atol=1e-5)
 
 
 def test_temporal_encoder_supports_history_shapes(tmp_path: Path) -> None:

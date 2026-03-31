@@ -12,56 +12,60 @@ val_days = 1
 test_days = 1
 
 [env]
-nmax = 64
-min_active_agents = 24
-max_active_agents = 64
+nmax = 16
+min_active_agents = 10
+max_active_agents = 10
 charge_station_count = 5
 charger_capacity = 4
 max_queue_length = 8
 battery_low_threshold = 0.25
 battery_mid_threshold = 0.60
-charge_rate_per_step = 0.18
-move_consumption = 0.03
-service_consumption = 0.02
-idle_consumption = 0.005
+default_charge_price = 1.0
+battery_capacity_kwh = 60.0
+battery_min_kwh = 5.0
+init_battery_min_ratio = 0.40
+init_battery_max_ratio = 1.00
+energy_per_km = 0.15
+charge_power_kw = 50.0
+reposition_distance_km = 2.0
+death_penalty = 25.0
 low_battery_penalty_weight = 0.35
 empty_move_penalty = 0.08
 idle_penalty = 0.02
 service_violation_penalty = 0.05
-default_charge_price = 1.0
 
 [model]
 variant = "v2"
-zone_embedding_dim = 20
-hidden_dim = 160
-fleet_hidden_dim = 160
+zone_embedding_dim = 16
+hidden_dim = 128
+fleet_hidden_dim = 128
 dropout = 0.1
-aux_hidden_dim = 96
-critic_ensemble_size = 3
-vehicle_token_dim = 160
+aux_hidden_dim = 64
+critic_ensemble_size = 2
+vehicle_token_dim = 128
 use_layer_norm = true
 
 [set_encoder]
-type = "set_transformer"
-hidden_dim = 160
+type = "deepsets"
+hidden_dim = 128
 num_heads = 4
 num_inducing_points = 8
 pooling = "mean"
 use_fleet_signature_skip = true
 
 [temporal]
-history_len = 8
+history_len = 6
 encoder_type = "gru"
-hidden_dim = 128
+hidden_dim = 96
 num_layers = 1
 
 [train]
-seed = 11
+seed = 21
 device = "auto"
-total_episodes = 80
+total_episodes = 40
 rollout_episodes_per_update = 1
 ppo_epochs = 4
-minibatch_size = 16
+minibatch_size = 8
 gamma = 0.99
 gae_lambda = 0.95
 ppo_clip = 0.2
@@ -72,25 +76,25 @@ cost_value_coef = 0.3
 learning_rate = 0.0003
 weight_decay = 0.00001
 max_grad_norm = 0.8
-eval_interval = 10
-save_interval = 10
+eval_interval = 5
+save_interval = 5
 
 [domain_randomization]
 enabled = true
-demand_scale_min = 0.85
-demand_scale_max = 1.20
-travel_time_noise_min = 0.90
-travel_time_noise_max = 1.20
-charge_price_scale_min = 0.90
-charge_price_scale_max = 1.25
-charger_capacity_scale_min = 0.70
+demand_scale_min = 0.90
+demand_scale_max = 1.10
+travel_time_noise_min = 0.95
+travel_time_noise_max = 1.10
+charge_price_scale_min = 0.95
+charge_price_scale_max = 1.10
+charger_capacity_scale_min = 0.85
 charger_capacity_scale_max = 1.00
-peak_shock_probability = 0.2
-peak_shock_scale_min = 1.10
-peak_shock_scale_max = 1.60
-event_day_probability = 0.15
-event_day_scale_min = 1.20
-event_day_scale_max = 1.80
+peak_shock_probability = 0.10
+peak_shock_scale_min = 1.05
+peak_shock_scale_max = 1.25
+event_day_probability = 0.05
+event_day_scale_min = 1.05
+event_day_scale_max = 1.20
 apply_to_eval = false
 
 [reward]
@@ -101,21 +105,21 @@ battery_weight = 1.0
 [offline_rl]
 enabled = true
 algorithm = "iql"
-dataset_episodes = 10
-pretrain_epochs = 3
-batch_size = 32
+dataset_episodes = 8
+pretrain_epochs = 2
+batch_size = 16
 expectile = 0.7
 temperature = 2.0
 cql_alpha = 0.1
 awac_lambda = 1.0
 
 [online_finetune]
-offline_ratio_start = 0.8
+offline_ratio_start = 0.7
 offline_ratio_end = 0.1
-offline_ratio_decay_steps = 120
+offline_ratio_decay_steps = 80
 planner_enabled = true
 uncertainty_threshold = 0.22
-online_replay_capacity = 4096
+online_replay_capacity = 2048
 
 [safety]
 battery_limit = 0.05
@@ -142,8 +146,8 @@ uncertainty_penalty_weight = 0.25
 [evaluation]
 standard_episodes = 1
 stress_episodes = 1
-unseen_fleet_sizes = [16, 32, 48, 64]
+unseen_fleet_sizes = [15]
 charger_outage_levels = [0.0, 0.25, 0.5]
-demand_shock_levels = [1.0, 1.25, 1.5]
-travel_time_shock_levels = [1.0, 1.15, 1.3]
-event_day_presets = ["baseline", "concert", "rain"]
+demand_shock_levels = [1.0, 1.25]
+travel_time_shock_levels = [1.0, 1.15]
+event_day_presets = ["baseline", "concert"]

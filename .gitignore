@@ -8,8 +8,15 @@ __pycache__/
 .mypy_cache/
 .pytest_cache/
 pytest-cache-files-*/
-outputs/
-data/
+outputs/*
+!outputs/.gitkeep
+data/*
+!data/raw/
+!data/processed/
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
 *.pt
 *.png
 *.csv

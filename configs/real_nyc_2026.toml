@@ -20,15 +20,19 @@ charger_capacity = 4
 max_queue_length = 8
 battery_low_threshold = 0.25
 battery_mid_threshold = 0.60
-charge_rate_per_step = 0.18
-move_consumption = 0.03
-service_consumption = 0.02
-idle_consumption = 0.005
+default_charge_price = 1.0
+battery_capacity_kwh = 60.0
+battery_min_kwh = 5.0
+init_battery_min_ratio = 0.40
+init_battery_max_ratio = 1.00
+energy_per_km = 0.15
+charge_power_kw = 50.0
+reposition_distance_km = 2.0
+death_penalty = 25.0
 low_battery_penalty_weight = 0.35
 empty_move_penalty = 0.08
 idle_penalty = 0.02
 service_violation_penalty = 0.05
-default_charge_price = 1.0
 
 [model]
 variant = "v2"

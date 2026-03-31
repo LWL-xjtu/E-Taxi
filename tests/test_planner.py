@@ -28,7 +28,7 @@ def _build_components(tmp_path: Path):
     env = CometTaxiEnv(dataset, config, seed=3)
     dims = infer_model_dimensions(
         dataset.metadata["data"]["cell_count"],
-        charger_count=config.env.charge_station_count,
+        charger_count=len(dataset.metadata["charge_stations"]),
         history_len=config.temporal.history_len,
     )
     actor = COMETActorV2(config.model, config.set_encoder, config.temporal, dims)
@@ -51,7 +51,7 @@ def test_uncertainty_gate_and_fallback_trigger(tmp_path: Path) -> None:
     config, env, actor, critic, cost_critic, normalizer, planner = _build_components(tmp_path)
     observation = env.reset("train")
     for vehicle in env.vehicles:
-        vehicle.soc = 0.05
+        vehicle.battery_kwh = 4.0
     observation = env._build_observation()
     output = planner.select_actions(
         actor=actor,

@@ -118,6 +118,8 @@ class VehicleTokenEncoder(nn.Module):
     def __init__(self, model_config: ModelConfig, dims: ModelDimensions) -> None:
         super().__init__()
         self.dims = dims
+        # Each agent keeps its own local token. Shared parameters let the policy
+        # learn a reusable decision rule that does not depend on a fixed fleet size.
         self.zone_embedding = nn.Embedding(dims.cell_count + 1, model_config.zone_embedding_dim)
         numeric_dim = dims.local_dim - 1
         self.numeric_encoder = _mlp(
@@ -152,6 +154,10 @@ class FleetSetEncoder(nn.Module):
         self.set_type = set_config.type
         self.pooling = set_config.pooling
         self.use_skip = set_config.use_fleet_signature_skip
+        # Deep Sets stays permutation invariant because every token first passes
+        # through the same phi network and then only a commutative masked pooling
+        # operation is applied. This is what makes 10-train / 15-test feasible:
+        # the encoder does not assume a fixed agent order or a fixed agent count.
         self.phi = _mlp(token_dim, set_config.hidden_dim, token_dim, model_config.dropout)
         self.rho = _mlp(token_dim, set_config.hidden_dim, model_config.hidden_dim, model_config.dropout)
         self.fleet_skip = _mlp(
@@ -292,6 +298,11 @@ class COMETActorV2(nn.Module):
         super().__init__()
         self.dims = dims
         self.backbone = ObservationBackboneV2(model_config, set_config, temporal_config, dims)
+        # The actor now reasons over:
+        # 1) local vehicle token
+        # 2) learned fleet context from the active set of agents
+        # 3) temporal context from recent demand / charger / price / delay history
+        # Hand-crafted fleet_signature only remains as a skip feature.
         policy_input_dim = (
             model_config.vehicle_token_dim
             + model_config.hidden_dim

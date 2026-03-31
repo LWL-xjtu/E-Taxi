@@ -17,18 +17,16 @@ from .constants import (
 class GreedyDispatchPolicy:
     def __init__(self, config: ExperimentConfig) -> None:
         self.config = config
-        self.cell_count = config.data.grid_rows * config.data.grid_cols
-
-    def _zone_to_row_col(self, zone: int) -> tuple[int, int]:
-        return divmod(zone, self.config.data.grid_cols)
 
     def act(self, observation: dict[str, np.ndarray]) -> np.ndarray:
         actions = np.zeros(self.config.env.nmax, dtype=np.int64)
         demand = observation.get("demand_vector")
         if demand is None:
+            cell_count = int(self.config.data.cell_count)
             demand = observation["fleet_signature"][
-                self.cell_count * 4 * 3 : self.cell_count * 4 * 3 + self.cell_count
+                cell_count * 4 * 3 : cell_count * 4 * 3 + cell_count
             ]
+        move_targets = observation.get("move_target_zones")
 
         for slot in range(self.config.env.nmax):
             if observation["agent_mask"][slot] <= 0:
@@ -48,20 +46,18 @@ class GreedyDispatchPolicy:
                 actions[slot] = ACTION_GO_CHARGE
                 continue
 
-            row, col = self._zone_to_row_col(max(zone, 0))
             neighbor_candidates = [
-                (ACTION_MOVE_NORTH, row - 1, col),
-                (ACTION_MOVE_SOUTH, row + 1, col),
-                (ACTION_MOVE_EAST, row, col + 1),
-                (ACTION_MOVE_WEST, row, col - 1),
+                (ACTION_MOVE_NORTH, int(move_targets[slot, 0]) if move_targets is not None else zone),
+                (ACTION_MOVE_SOUTH, int(move_targets[slot, 1]) if move_targets is not None else zone),
+                (ACTION_MOVE_EAST, int(move_targets[slot, 2]) if move_targets is not None else zone),
+                (ACTION_MOVE_WEST, int(move_targets[slot, 3]) if move_targets is not None else zone),
             ]
             best_action = ACTION_STAY
             best_demand = demand[zone] if zone >= 0 else 0.0
-            for action, next_row, next_col in neighbor_candidates:
+            for action, next_zone in neighbor_candidates:
                 if action_mask[action] <= 0:
                     continue
-                next_zone = next_row * self.config.data.grid_cols + next_col
-                if 0 <= next_zone < self.cell_count and demand[next_zone] > best_demand:
+                if 0 <= next_zone < demand.shape[0] and demand[next_zone] > best_demand:
                     best_demand = demand[next_zone]
                     best_action = action
             actions[slot] = best_action
