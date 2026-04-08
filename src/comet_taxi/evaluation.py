@@ -105,7 +105,7 @@ def evaluate_checkpoint(
     stress: bool = False,
 ) -> pd.DataFrame:
     device = resolve_device(config.train.device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     actor.load_state_dict(checkpoint["actor_state_dict"])
     actor.to(device)
     actor.eval()
@@ -120,6 +120,7 @@ def evaluate_checkpoint(
         cost_critic.eval()
     if normalizer is not None and checkpoint.get("normalizer_state_dict"):
         normalizer.load_state_dict(checkpoint["normalizer_state_dict"])
+        normalizer.to(device)
 
     def select_actions(observation: dict[str, object]) -> object:
         actions, _, planner_info = action_selection_from_policy(

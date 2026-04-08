@@ -134,7 +134,7 @@ class CometTrainer:
             shutil.copy2(checkpoint_path, best_path)
 
     def load_checkpoint(self, checkpoint_path: str | Path) -> None:
-        checkpoint = torch.load(Path(checkpoint_path), map_location=self.device)
+        checkpoint = torch.load(Path(checkpoint_path), map_location=self.device, weights_only=False)
         self.actor.load_state_dict(checkpoint["actor_state_dict"])
         self.critic.load_state_dict(checkpoint["critic_state_dict"])
         if self.cost_critic is not None and checkpoint.get("cost_critic_state_dict"):
@@ -142,6 +142,7 @@ class CometTrainer:
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if self.normalizer is not None and checkpoint.get("normalizer_state_dict"):
             self.normalizer.load_state_dict(checkpoint["normalizer_state_dict"])
+            self.normalizer.to(self.device)
         self.constraint_multipliers.update(checkpoint.get("constraint_multipliers", {}))
         self.scheduler_state.update(checkpoint.get("scheduler_state", {}))
         self.best_val_mean_team_reward = float(

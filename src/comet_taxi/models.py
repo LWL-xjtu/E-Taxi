@@ -81,7 +81,9 @@ class RunningMeanStd(nn.Module):
         self.count.copy_(total)
 
     def normalize(self, values: torch.Tensor) -> torch.Tensor:
-        return (values - self.mean) / torch.sqrt(self.var + 1e-6)
+        mean = self.mean.to(device=values.device, dtype=values.dtype)
+        var = self.var.to(device=values.device, dtype=values.dtype)
+        return (values - mean) / torch.sqrt(var + 1e-6)
 
 
 class ObservationNormalizer(nn.Module):
