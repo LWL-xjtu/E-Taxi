@@ -51,14 +51,22 @@ def test_smoke_training_produces_outputs_and_resume_checkpoint(tmp_path: Path) -
     assert (output_dir / "reward_curve.csv").exists()
     assert (output_dir / "checkpoints" / "latest.pt").exists()
     assert (output_dir / "checkpoints" / "best_val.pt").exists()
+    assert (output_dir / "checkpoints" / "best_policy_val.pt").exists()
+    assert (output_dir / "checkpoints" / "best_runtime_val.pt").exists()
     metrics = pd.read_csv(output_dir / "metrics.csv")
     for column in (
         "train_battery_violation_rate",
         "train_charger_overflow_rate",
         "train_service_violation_rate",
+        "train_service_utilization_rate",
+        "train_policy_selected_rate",
+        "train_planner_selected_rate",
         "lambda_battery",
         "lambda_charger",
         "lambda_service",
+        "lambda_battery_ema",
+        "lambda_charger_ema",
+        "lambda_service_ema",
         "train_fallback_rate",
         "train_uncertainty_trigger_rate",
         "offline_ratio",
@@ -67,9 +75,14 @@ def test_smoke_training_produces_outputs_and_resume_checkpoint(tmp_path: Path) -
         "episodes_per_hour",
         "steps_per_second",
         "best_val_mean_team_reward",
+        "best_runtime_mean_team_reward",
+        "constraint_warmup_active",
         "checkpoint_tag",
     ):
         assert column in metrics.columns
+    online_rows = metrics[metrics["episode"] > 0].copy()
+    assert (online_rows["train_fallback_rate"] == 0.0).all()
+    assert (online_rows["train_policy_selected_rate"] > 0.0).all()
 
     resumed_config = _build_small_formal_config()
     resumed_config.train.total_episodes = 2

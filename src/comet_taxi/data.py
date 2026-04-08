@@ -542,9 +542,43 @@ def export_offline_transition_dataset(
     from .baselines import GreedyDispatchPolicy
     from .env import CometTaxiEnv
 
+    def sample_random_legal_action(
+        observation: dict[str, np.ndarray],
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        sampled = np.zeros(config.env.nmax, dtype=np.int64)
+        for slot in range(config.env.nmax):
+            if observation["agent_mask"][slot] <= 0:
+                continue
+            legal = np.flatnonzero(observation["action_mask"][slot] > 0)
+            sampled[slot] = int(rng.choice(legal)) if legal.size > 0 else 0
+        return sampled
+
+    def charge_biased_safe_action(observation: dict[str, np.ndarray]) -> np.ndarray:
+        sampled = np.zeros(config.env.nmax, dtype=np.int64)
+        charger_queue = observation.get("charger_queue", np.zeros(1, dtype=np.float32))
+        for slot in range(config.env.nmax):
+            if observation["agent_mask"][slot] <= 0:
+                continue
+            action_mask = observation["action_mask"][slot]
+            soc = float(observation["local_obs"][slot, 4])
+            if (
+                soc < config.planner.risk_trigger_soc
+                and action_mask[2] > 0
+                and float(np.max(charger_queue)) <= config.env.max_queue_length
+            ):
+                sampled[slot] = 2
+            elif action_mask[1] > 0:
+                sampled[slot] = 1
+            else:
+                legal = np.flatnonzero(action_mask > 0)
+                sampled[slot] = int(legal[0]) if legal.size > 0 else 0
+        return sampled
+
     env = CometTaxiEnv(dataset, config, seed=seed if seed is not None else config.train.seed)
     policy = GreedyDispatchPolicy(config)
     episode_count = int(episodes if episodes is not None else config.offline_rl.dataset_episodes)
+    rng = np.random.default_rng(seed if seed is not None else config.train.seed)
 
     local_obs: list[np.ndarray] = []
     fleet_signature: list[np.ndarray] = []
@@ -565,12 +599,27 @@ def export_offline_transition_dataset(
     aux_charger_occupancy: list[np.ndarray] = []
     aux_travel_residual: list[np.ndarray] = []
 
-    for _ in range(episode_count):
+    for episode_index in range(episode_count):
+        env.set_training_progress(episode_index + 1, episode_count, curriculum_cap=0.6)
         observation = env.reset("train")
         episode_rewards: list[float] = []
         done = False
+        behavior_mode = episode_index % 3
         while not done:
-            action = policy.act(observation)
+            greedy_action = policy.act(observation)
+            if behavior_mode == 0:
+                action = greedy_action
+            elif behavior_mode == 1:
+                action = greedy_action.copy()
+                random_action = sample_random_legal_action(observation, rng)
+                epsilon = 0.15
+                for slot in range(config.env.nmax):
+                    if observation["agent_mask"][slot] <= 0:
+                        continue
+                    if rng.random() < epsilon:
+                        action[slot] = random_action[slot]
+            else:
+                action = charge_biased_safe_action(observation)
             next_observation, _, team_reward, done, info = env.step(action)
             episode_rewards.append(team_reward)
             local_obs.append(observation["local_obs"])

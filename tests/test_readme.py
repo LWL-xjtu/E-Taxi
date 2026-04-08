@@ -14,5 +14,8 @@ def test_readme_mentions_formal_generalist_workflow() -> None:
         "outputs/formal_generalist_run",
         "outputs/formal_generalist_eval",
         "--resume-checkpoint",
+        "best_policy_val.pt",
+        "planner_runtime",
+        "policy_only",
     ):
         assert snippet in readme

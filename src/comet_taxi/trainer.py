@@ -29,7 +29,12 @@ from .models import (
     infer_model_dimensions,
 )
 from .planner import CandidatePlanner
-from .runtime import action_selection_from_policy, policy_statistics, resolve_device
+from .runtime import (
+    UncertaintyCalibrator,
+    action_selection_from_policy,
+    policy_statistics,
+    resolve_device,
+)
 from .utils import ensure_dir, seed_everything
 
 
@@ -78,10 +83,13 @@ class CometTrainer:
         self.online_replay = TransitionReplayBuffer(config.online_finetune.online_replay_capacity)
         self.planner = CandidatePlanner(config)
         self.constraint_multipliers = {name: config.safety.multiplier_init for name in COST_NAMES}
+        self.constraint_ema = {name: 0.0 for name in COST_NAMES}
         self.scheduler_state = {"step": 0}
         self.start_episode = 1
         self.best_val_mean_team_reward = float("-inf")
+        self.best_runtime_mean_team_reward = float("-inf")
         self.resume_wall_clock_seconds = 0.0
+        self.uncertainty_calibrator = UncertaintyCalibrator()
         seed_everything(config.train.seed)
         if resume_checkpoint is not None:
             self.load_checkpoint(resume_checkpoint)
@@ -119,17 +127,20 @@ class CometTrainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "normalizer_state_dict": self.normalizer.state_dict() if self.normalizer is not None else None,
             "constraint_multipliers": self.constraint_multipliers,
+            "constraint_ema": self.constraint_ema,
             "scheduler_state": self.scheduler_state,
             "best_val_mean_team_reward": self.best_val_mean_team_reward,
+            "best_runtime_mean_team_reward": self.best_runtime_mean_team_reward,
             "resume_wall_clock_seconds": self.resume_wall_clock_seconds,
+            "uncertainty_calibrator_state_dict": self.uncertainty_calibrator.state_dict(),
         }
         torch.save(checkpoint, checkpoint_path)
         torch.save(checkpoint, self.checkpoint_dir / "latest.pt")
         return checkpoint_path
 
-    def _save_best_checkpoint(self, episode: int) -> None:
+    def _save_named_checkpoint(self, episode: int, target_name: str) -> None:
         checkpoint_path = self.checkpoint_dir / f"episode_{episode:04d}.pt"
-        best_path = self.checkpoint_dir / "best_val.pt"
+        best_path = self.checkpoint_dir / target_name
         if checkpoint_path.exists():
             shutil.copy2(checkpoint_path, best_path)
 
@@ -144,12 +155,19 @@ class CometTrainer:
             self.normalizer.load_state_dict(checkpoint["normalizer_state_dict"])
             self.normalizer.to(self.device)
         self.constraint_multipliers.update(checkpoint.get("constraint_multipliers", {}))
+        self.constraint_ema.update(checkpoint.get("constraint_ema", {}))
         self.scheduler_state.update(checkpoint.get("scheduler_state", {}))
         self.best_val_mean_team_reward = float(
             checkpoint.get("best_val_mean_team_reward", self.best_val_mean_team_reward)
         )
+        self.best_runtime_mean_team_reward = float(
+            checkpoint.get("best_runtime_mean_team_reward", self.best_runtime_mean_team_reward)
+        )
         self.resume_wall_clock_seconds = float(
             checkpoint.get("resume_wall_clock_seconds", self.resume_wall_clock_seconds)
+        )
+        self.uncertainty_calibrator.load_state_dict(
+            checkpoint.get("uncertainty_calibrator_state_dict")
         )
         self.start_episode = int(checkpoint.get("episode", 0)) + 1
         metrics_path = self.output_dir / "metrics.csv"
@@ -224,7 +242,44 @@ class CometTrainer:
         normalized = self._normalize_observation(observation, update_stats=False)
         return float(self.critic(normalized).mean.item())
 
-    def _run_rollout(self) -> tuple[RolloutBatch, dict[str, float]]:
+    def _critic_uncertainty_std(self, observation: dict[str, np.ndarray]) -> float:
+        if self.legacy_mode or not isinstance(self.critic, EnsembleCritic):
+            return 0.0
+        normalized = self._normalize_observation(observation, update_stats=False)
+        with torch.no_grad():
+            critic_output = self.critic(normalized)
+        return float(torch.sqrt(critic_output.variance.mean() + 1e-8).item())
+
+    def _make_action_selector(self, execution_mode: str, current_episode: int) -> Any:
+        def _select(observation: dict[str, Any]) -> Any:
+            actions, _, planner_info = action_selection_from_policy(
+                self.actor,
+                observation,
+                self.device,
+                critic=self.critic if isinstance(self.critic, EnsembleCritic) else None,
+                cost_critic=self.cost_critic,
+                planner=self.planner,
+                env=self.env,
+                normalizer=self.normalizer,
+                planner_enabled=self.config.online_finetune.planner_enabled,
+                execution_mode=execution_mode,
+                uncertainty_calibrator=self.uncertainty_calibrator,
+                current_episode=current_episode,
+            )
+            active_agents = int(np.asarray(observation["agent_mask"]).sum())
+            self.env.register_runtime_feedback(
+                policy_count=int(np.asarray(planner_info["policy_selected_mask"]).sum()),
+                planner_count=int(np.asarray(planner_info["planner_selected_mask"]).sum()),
+                fallback_count=int(np.asarray(planner_info["fallback_mask"]).sum()),
+                uncertainty_count=int(np.asarray(planner_info["uncertainty_mask"]).sum()),
+                decision_steps=active_agents,
+            )
+            return actions
+
+        return _select
+
+    def _run_rollout(self, episode: int) -> tuple[RolloutBatch, dict[str, float]]:
+        self.env.set_training_progress(episode, self.config.train.total_episodes)
         observation = self.env.reset("train")
         buffer = RolloutBuffer()
         done = False
@@ -232,6 +287,8 @@ class CometTrainer:
         while not done:
             if self.normalizer is not None:
                 self.normalizer.update(observation)
+            if not self.legacy_mode:
+                self.uncertainty_calibrator.update(self._critic_uncertainty_std(observation))
             actions, log_probs, planner_info = action_selection_from_policy(
                 self.actor,
                 observation,
@@ -242,11 +299,16 @@ class CometTrainer:
                 env=self.env,
                 normalizer=self.normalizer,
                 planner_enabled=self.config.online_finetune.planner_enabled,
+                execution_mode=self.config.train.execution_mode,
+                uncertainty_calibrator=self.uncertainty_calibrator,
+                current_episode=episode,
             )
             self.env.register_runtime_feedback(
+                policy_count=int(np.asarray(planner_info["policy_selected_mask"]).sum()),
+                planner_count=int(np.asarray(planner_info["planner_selected_mask"]).sum()),
                 fallback_count=int(np.asarray(planner_info["fallback_mask"]).sum()),
                 uncertainty_count=int(np.asarray(planner_info["uncertainty_mask"]).sum()),
-                planner_steps=int(np.asarray(observation["agent_mask"]).sum()),
+                decision_steps=int(np.asarray(observation["agent_mask"]).sum()),
             )
             value = self._critic_value(observation)
             next_observation, _, team_reward, done, info = self.env.step(actions)
@@ -512,19 +574,29 @@ class CometTrainer:
             "mixed_actor_loss": losses["offline_actor_loss"],
         }
 
-    def _update_multipliers(self, batch: RolloutBatch) -> None:
+    def _update_multipliers(self, batch: RolloutBatch, episode: int) -> bool:
         if self.legacy_mode:
-            return
-        observed = batch.cost_returns.mean(dim=0).detach().cpu().numpy()
+            return False
+        if episode <= self.config.safety.constraint_warmup_episodes:
+            return True
+        observed = batch.costs.mean(dim=0).detach().cpu().numpy()
         limits = {
             "battery_violation_cost": self.config.safety.battery_limit,
             "charger_overflow_cost": self.config.safety.charger_limit,
             "service_violation_cost": self.config.safety.service_limit,
         }
         for index, name in enumerate(COST_NAMES):
-            error = float(observed[index] - limits[name])
+            ema = (
+                self.config.safety.multiplier_ema_decay * self.constraint_ema[name]
+                + (1.0 - self.config.safety.multiplier_ema_decay) * float(observed[index])
+            )
+            self.constraint_ema[name] = float(ema)
+            error = float(np.clip(ema - limits[name], -1.0, 1.0))
             updated = self.constraint_multipliers[name] + self.config.safety.multiplier_lr * error
-            self.constraint_multipliers[name] = max(0.0, float(updated))
+            self.constraint_multipliers[name] = float(
+                np.clip(updated, 0.0, self.config.safety.multiplier_max)
+            )
+        return False
     def train(self) -> pd.DataFrame:
         config_path = self.output_dir / "config_snapshot.json"
         config_path.write_text(json.dumps(self.config.to_dict(), indent=2), encoding="utf-8")
@@ -533,32 +605,13 @@ class CometTrainer:
             offline_metrics = self._offline_pretrain()
             self.history.append({"episode": 0, **offline_metrics})
 
-        def _eval_actions(observation: dict[str, Any]) -> Any:
-            actions, _, planner_info = action_selection_from_policy(
-                self.actor,
-                observation,
-                self.device,
-                critic=self.critic if isinstance(self.critic, EnsembleCritic) else None,
-                cost_critic=self.cost_critic,
-                planner=self.planner,
-                env=self.env,
-                normalizer=self.normalizer,
-                planner_enabled=self.config.online_finetune.planner_enabled,
-            )
-            self.env.register_runtime_feedback(
-                fallback_count=int(np.asarray(planner_info["fallback_mask"]).sum()),
-                uncertainty_count=int(np.asarray(planner_info["uncertainty_mask"]).sum()),
-                planner_steps=int(np.asarray(observation["agent_mask"]).sum()),
-            )
-            return actions
-
         cumulative_env_steps = 0
         for episode in range(self.start_episode, self.config.train.total_episodes + 1):
-            batch, info = self._run_rollout()
+            batch, info = self._run_rollout(episode)
             cumulative_env_steps += int(batch.returns.shape[0])
             losses = self._update_online(batch)
             mixed_losses = self._mixed_replay_update()
-            self._update_multipliers(batch)
+            constraint_warmup_active = self._update_multipliers(batch, episode)
             self.scheduler_state["step"] += 1
             elapsed = self.resume_wall_clock_seconds + (time.perf_counter() - train_start)
             hours = max(elapsed / 3600.0, 1e-6)
@@ -570,33 +623,77 @@ class CometTrainer:
                 "train_battery_violation_rate": float(info["battery_violation_rate"]),
                 "train_charger_overflow_rate": float(info["charger_overflow_rate"]),
                 "train_service_violation_rate": float(info["service_violation_rate"]),
+                "train_service_utilization_rate": float(info["service_utilization_rate"]),
+                "train_policy_selected_rate": float(info["policy_selected_rate"]),
+                "train_planner_selected_rate": float(info["planner_selected_rate"]),
                 "train_fallback_rate": float(info["fallback_rate"]),
                 "train_uncertainty_trigger_rate": float(info["uncertainty_trigger_rate"]),
                 "lambda_battery": self.constraint_multipliers["battery_violation_cost"],
                 "lambda_charger": self.constraint_multipliers["charger_overflow_cost"],
                 "lambda_service": self.constraint_multipliers["service_violation_cost"],
+                "lambda_battery_ema": self.constraint_ema["battery_violation_cost"],
+                "lambda_charger_ema": self.constraint_ema["charger_overflow_cost"],
+                "lambda_service_ema": self.constraint_ema["service_violation_cost"],
+                "constraint_warmup_active": float(constraint_warmup_active),
                 "wall_clock_seconds": elapsed,
                 "episodes_per_hour": float(max(episode - self.start_episode + 1, 1) / hours),
                 "steps_per_second": float(cumulative_env_steps / max(elapsed, 1e-6)),
                 "best_val_mean_team_reward": self.best_val_mean_team_reward,
+                "best_runtime_mean_team_reward": self.best_runtime_mean_team_reward,
                 "checkpoint_tag": "none",
                 **losses,
                 **mixed_losses,
             }
 
+            best_policy_pending = False
+            best_runtime_pending = False
             if episode % self.config.train.eval_interval == 0:
-                metrics_frame, _ = evaluate_policy(self.env, _eval_actions, "val", episodes=1)
-                eval_mean_team_reward = None
-                for key, value in metrics_frame.iloc[0].to_dict().items():
-                    if key in {"split", "episodes", "scenario"}:
+                policy_metrics_frame, _ = evaluate_policy(
+                    self.env,
+                    self._make_action_selector(self.config.train.validation_execution_mode, episode),
+                    "val",
+                    episodes=1,
+                    scenario_name="policy_validation",
+                )
+                policy_mean_team_reward = None
+                for key, value in policy_metrics_frame.iloc[0].to_dict().items():
+                    if key in {"split", "episodes", "scenario", "execution_mode"}:
                         continue
+                    record[f"eval_policy_{key}"] = float(value)
                     record[f"eval_{key}"] = float(value)
                     if key == "mean_team_reward":
-                        eval_mean_team_reward = float(value)
-                if eval_mean_team_reward is not None and eval_mean_team_reward > self.best_val_mean_team_reward:
-                    self.best_val_mean_team_reward = eval_mean_team_reward
+                        policy_mean_team_reward = float(value)
+                if policy_mean_team_reward is not None:
+                    record["eval_mean_team_reward"] = policy_mean_team_reward
+                if (
+                    policy_mean_team_reward is not None
+                    and policy_mean_team_reward > self.best_val_mean_team_reward
+                ):
+                    self.best_val_mean_team_reward = policy_mean_team_reward
                     record["best_val_mean_team_reward"] = self.best_val_mean_team_reward
-                    record["checkpoint_tag"] = "best_pending"
+                    best_policy_pending = True
+
+                runtime_metrics_frame, _ = evaluate_policy(
+                    self.env,
+                    self._make_action_selector(self.config.planner.runtime_execution_mode, episode),
+                    "val",
+                    episodes=1,
+                    scenario_name="runtime_validation",
+                )
+                runtime_mean_team_reward = None
+                for key, value in runtime_metrics_frame.iloc[0].to_dict().items():
+                    if key in {"split", "episodes", "scenario", "execution_mode"}:
+                        continue
+                    record[f"eval_runtime_{key}"] = float(value)
+                    if key == "mean_team_reward":
+                        runtime_mean_team_reward = float(value)
+                if (
+                    runtime_mean_team_reward is not None
+                    and runtime_mean_team_reward > self.best_runtime_mean_team_reward
+                ):
+                    self.best_runtime_mean_team_reward = runtime_mean_team_reward
+                    record["best_runtime_mean_team_reward"] = self.best_runtime_mean_team_reward
+                    best_runtime_pending = True
 
             self.history.append(record)
 
@@ -604,14 +701,32 @@ class CometTrainer:
             if episode % self.config.train.save_interval == 0 or episode == self.config.train.total_episodes:
                 self._save_checkpoint(episode)
                 checkpoint_tag = "periodic+latest"
-                if record["checkpoint_tag"] == "best_pending":
-                    self._save_best_checkpoint(episode)
-                    checkpoint_tag = "best+periodic+latest"
-            elif record["checkpoint_tag"] == "best_pending":
+                if best_policy_pending:
+                    self._save_named_checkpoint(episode, "best_policy_val.pt")
+                    self._save_named_checkpoint(episode, "best_val.pt")
+                if best_runtime_pending:
+                    self._save_named_checkpoint(episode, "best_runtime_val.pt")
+                if best_policy_pending and best_runtime_pending:
+                    checkpoint_tag = "best_policy+best_runtime+periodic+latest"
+                elif best_policy_pending:
+                    checkpoint_tag = "best_policy+periodic+latest"
+                elif best_runtime_pending:
+                    checkpoint_tag = "best_runtime+periodic+latest"
+            elif best_policy_pending or best_runtime_pending:
                 self._save_checkpoint(episode)
-                self._save_best_checkpoint(episode)
-                checkpoint_tag = "best+latest"
+                if best_policy_pending:
+                    self._save_named_checkpoint(episode, "best_policy_val.pt")
+                    self._save_named_checkpoint(episode, "best_val.pt")
+                if best_runtime_pending:
+                    self._save_named_checkpoint(episode, "best_runtime_val.pt")
+                if best_policy_pending and best_runtime_pending:
+                    checkpoint_tag = "best_policy+best_runtime+latest"
+                elif best_policy_pending:
+                    checkpoint_tag = "best_policy+latest"
+                else:
+                    checkpoint_tag = "best_runtime+latest"
             record["best_val_mean_team_reward"] = self.best_val_mean_team_reward
+            record["best_runtime_mean_team_reward"] = self.best_runtime_mean_team_reward
             record["checkpoint_tag"] = checkpoint_tag
             self.resume_wall_clock_seconds = elapsed
 

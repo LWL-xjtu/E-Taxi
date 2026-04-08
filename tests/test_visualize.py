@@ -43,6 +43,7 @@ def test_visualization_writes_expected_assets(tmp_path: Path) -> None:
                 "eval_empty_travel_ratio": 0.22,
                 "eval_battery_safety_rate": 0.9,
                 "eval_charging_efficiency": 0.8,
+                "eval_service_utilization_rate": 0.7,
             },
         ]
     ).to_csv(train_dir / "metrics.csv", index=False)
@@ -59,11 +60,15 @@ def test_visualization_writes_expected_assets(tmp_path: Path) -> None:
                 "empty_travel_ratio": 0.21,
                 "battery_safety_rate": 0.93,
                 "charging_efficiency": 0.84,
+                "service_utilization_rate": 0.75,
                 "battery_violation_rate": 0.04,
                 "charger_overflow_rate": 0.02,
                 "service_violation_rate": 0.1,
+                "policy_selected_rate": 1.0,
+                "planner_selected_rate": 0.0,
                 "fallback_rate": 0.05,
                 "uncertainty_trigger_rate": 0.06,
+                "execution_mode": "policy_only",
             },
             {
                 "split": "test",
@@ -75,11 +80,15 @@ def test_visualization_writes_expected_assets(tmp_path: Path) -> None:
                 "empty_travel_ratio": 0.28,
                 "battery_safety_rate": 0.88,
                 "charging_efficiency": 0.72,
+                "service_utilization_rate": 0.61,
                 "battery_violation_rate": 0.08,
                 "charger_overflow_rate": 0.07,
                 "service_violation_rate": 0.18,
+                "policy_selected_rate": 0.3,
+                "planner_selected_rate": 0.5,
                 "fallback_rate": 0.12,
                 "uncertainty_trigger_rate": 0.15,
+                "execution_mode": "planner_runtime",
             },
         ]
     ).to_csv(eval_dir / "metrics.csv", index=False)
@@ -91,6 +100,7 @@ def test_visualization_writes_expected_assets(tmp_path: Path) -> None:
     plot_fallback_dashboard(comparison, output_dir)
 
     assert not comparison.empty
+    assert {"COMET-v2-policy", "COMET-v2-runtime"}.issubset(set(comparison["label"]))
     assert (output_dir / "training_dashboard.png").exists()
     assert (output_dir / "loss_dashboard.png").exists()
     assert (output_dir / "validation_dashboard.png").exists()

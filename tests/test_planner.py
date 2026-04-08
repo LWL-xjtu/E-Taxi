@@ -10,6 +10,7 @@ from comet_taxi.data import PreparedDataset, prepare_nyc_dataset
 from comet_taxi.env import CometTaxiEnv
 from comet_taxi.models import COMETActorV2, CostCritic, EnsembleCritic, ObservationNormalizer, infer_model_dimensions
 from comet_taxi.planner import CandidatePlanner
+from comet_taxi.runtime import UncertaintyCalibrator
 from comet_taxi.synthetic import write_synthetic_parquet
 
 
@@ -50,9 +51,13 @@ def test_candidate_generation_and_shape(tmp_path: Path) -> None:
 def test_uncertainty_gate_and_fallback_trigger(tmp_path: Path) -> None:
     config, env, actor, critic, cost_critic, normalizer, planner = _build_components(tmp_path)
     observation = env.reset("train")
-    for vehicle in env.vehicles:
-        vehicle.battery_kwh = 4.0
+    for index, vehicle in enumerate(env.vehicles):
+        vehicle.battery_kwh = 4.0 if index < 2 else 40.0
     observation = env._build_observation()
+    calibrator = UncertaintyCalibrator()
+    calibrator.mean = 0.0
+    calibrator.var = 1e-6
+    calibrator.count = 10.0
     output = planner.select_actions(
         actor=actor,
         critic=critic,
@@ -62,6 +67,36 @@ def test_uncertainty_gate_and_fallback_trigger(tmp_path: Path) -> None:
         env=env,
         normalizer=normalizer,
         planner_enabled=True,
+        uncertainty_calibrator=calibrator,
+        current_episode=config.planner.uncertainty_warmup_episodes + 1,
     )
     assert output.actions.shape == (config.env.nmax,)
-    assert np.sum(output.fallback_mask) >= 0
+    assert np.sum(output.fallback_mask) > 0
+    assert np.sum(output.planner_selected_mask) + np.sum(output.fallback_mask) > 0
+    assert output.uncertainty_z_values.shape == (config.env.nmax,)
+
+
+def test_low_risk_state_prefers_planner_not_fallback(tmp_path: Path) -> None:
+    config, env, actor, critic, cost_critic, normalizer, planner = _build_components(tmp_path)
+    observation = env.reset("train")
+    for vehicle in env.vehicles:
+        vehicle.battery_kwh = 45.0
+    observation = env._build_observation()
+    calibrator = UncertaintyCalibrator()
+    calibrator.mean = 10.0
+    calibrator.var = 1.0
+    calibrator.count = 10.0
+    output = planner.select_actions(
+        actor=actor,
+        critic=critic,
+        cost_critic=cost_critic,
+        observation=observation,
+        device=torch.device("cpu"),
+        env=env,
+        normalizer=normalizer,
+        planner_enabled=True,
+        uncertainty_calibrator=calibrator,
+        current_episode=config.planner.uncertainty_warmup_episodes + 1,
+    )
+    assert np.sum(output.fallback_mask) == 0
+    assert np.sum(output.planner_selected_mask) >= 0

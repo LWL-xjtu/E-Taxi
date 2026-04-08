@@ -9,7 +9,7 @@
 - 用 ghost + mask 处理动态智能体数量。
 - 用可学习车队编码器替代“人工群体摘要为主”的旧路径。
 - 用时间趋势编码器显式建模最近若干步需求、价格、拥堵和时延变化。
-- 用 planner + uncertainty gate + greedy fallback 组成运行时决策链路。
+- 训练阶段默认禁用回退，让 learned policy 真正收集数据；评估和部署阶段再启用 planner + uncertainty gate + greedy fallback。
 - 用单个 checkpoint 评估不同数量智能体、不同环境扰动下的泛化能力。
 
 当前正式训练默认使用 3 个月真实 TLC 数据：
@@ -71,7 +71,15 @@
 
 ### 2.4 Planner / Uncertainty / Fallback
 
-运行时不是“policy logits 直接采样 = 最终动作”，而是：
+训练和运行时现在明确分成两套执行模式：
+
+- 训练：`policy_sample`
+- 验证：`policy_greedy`
+- 部署/运行时：`planner_runtime`
+
+这样设计的目的是先让 actor 真正学会接单、充电和移动，再让 planner 在高风险场景提供保护，而不是一开始就把所有决策都退回给 Greedy。
+
+运行时 `planner_runtime` 不是“policy logits 直接采样 = 最终动作”，而是：
 
 1. 生成候选动作
 2. 用 actor logits 提供 prior
@@ -83,6 +91,8 @@
 
 评估指标里会持续记录：
 
+- `policy_selected_rate`
+- `planner_selected_rate`
 - `fallback_rate`
 - `uncertainty_trigger_rate`
 
@@ -300,7 +310,8 @@ train --config configs/formal_generalist.toml --data-dir data/processed/nyc_form
 
 - 用一个共享策略覆盖 `8 ~ 64` 个真实智能体
 - 训练时随机化智能体数量
-- 随机化需求强度、行程时延、充电价格、充电容量、事件冲击
+- 使用 curriculum 式 domain randomization，而不是一开始就上最强扰动
+- 训练执行模式是 `policy_sample`，不会让 planner/fallback 主导 PPO 行为数据
 - 得到一个适配多数量、多环境的单模型 checkpoint
 
 ### 8.3 断点续训
@@ -317,6 +328,8 @@ train --config configs/formal_generalist.toml --data-dir data/processed/nyc_form
 - optimizers
 - normalizer
 - constraint multipliers
+- constraint EMA
+- uncertainty calibrator
 - offline-to-online scheduler state
 - best validation reward
 - 已累计 wall clock 时间
@@ -326,13 +339,18 @@ train --config configs/formal_generalist.toml --data-dir data/processed/nyc_form
 如果你想先看标准 test split 上的效果：
 
 ```bash
-evaluate --config configs/formal_generalist.toml --data-dir data/processed/nyc_formal_q1 --checkpoint outputs/formal_generalist_run/checkpoints/best_val.pt --output-dir outputs/formal_generalist_eval --split test --episodes 2
+evaluate --config configs/formal_generalist.toml --data-dir data/processed/nyc_formal_q1 --checkpoint outputs/formal_generalist_run/checkpoints/best_policy_val.pt --output-dir outputs/formal_generalist_eval --split test --episodes 2
 ```
 
 输出目录示例：
 
 - `outputs/formal_generalist_eval/metrics.csv`
 - `outputs/formal_generalist_eval/episode_summaries.csv`
+
+默认会同时输出两种执行模式：
+
+- `policy_only`：只看 learned policy 本体能力
+- `planner_runtime`：看带不确定性保护和 fallback 的部署模式
 
 ## 10. 泛化评测：多数量、多环境
 
@@ -345,7 +363,7 @@ evaluate --config configs/formal_generalist.toml --data-dir data/processed/nyc_f
 ### 10.1 运行 stress / generalization evaluation
 
 ```bash
-evaluate --config configs/generalization_eval.toml --data-dir data/processed/nyc_formal_q1 --checkpoint outputs/formal_generalist_run/checkpoints/best_val.pt --output-dir outputs/formal_generalist_eval --split test --episodes 2 --stress
+evaluate --config configs/generalization_eval.toml --data-dir data/processed/nyc_formal_q1 --checkpoint outputs/formal_generalist_run/checkpoints/best_policy_val.pt --output-dir outputs/formal_generalist_eval --split test --episodes 2 --stress
 ```
 
 ### 10.2 默认评测矩阵
@@ -391,6 +409,12 @@ print(frame[['scenario', 'mean_team_reward', 'order_completion_rate', 'fallback_
 PY
 ```
 
+建议你先看：
+
+- `execution_mode == "policy_only"` 是否已经摆脱 Greedy
+- `execution_mode == "planner_runtime"` 是否在高风险场景下降低违规并保住收益
+- 如果 `fallback_rate` 仍然很高，说明模型本体还没有真正接管
+
 ## 11. Greedy Baseline
 
 如果你想和启发式基线比较：
@@ -426,7 +450,8 @@ visualize_results --train-dir outputs/formal_generalist_run --eval-dirs outputs/
 - `outputs/formal_generalist_run/reward_curve.csv`
 - `outputs/formal_generalist_run/reward_curve.png`
 - `outputs/formal_generalist_run/checkpoints/latest.pt`
-- `outputs/formal_generalist_run/checkpoints/best_val.pt`
+- `outputs/formal_generalist_run/checkpoints/best_policy_val.pt`
+- `outputs/formal_generalist_run/checkpoints/best_runtime_val.pt`
 - `outputs/formal_generalist_eval/metrics.csv`
 - `outputs/formal_generalist_eval/episode_summaries.csv`
 - `outputs/formal_generalist_viz/comparison_metrics.csv`
@@ -437,6 +462,7 @@ visualize_results --train-dir outputs/formal_generalist_run --eval-dirs outputs/
 - `episodes_per_hour`
 - `steps_per_second`
 - `best_val_mean_team_reward`
+- `best_runtime_mean_team_reward`
 - `checkpoint_tag`
 
 评估 `metrics.csv` 至少包含：
@@ -444,12 +470,16 @@ visualize_results --train-dir outputs/formal_generalist_run --eval-dirs outputs/
 - `mean_team_reward`
 - `order_completion_rate`
 - `average_profit_per_vehicle`
+- `service_utilization_rate`
 - `battery_violation_rate`
 - `charger_overflow_rate`
 - `service_violation_rate`
+- `policy_selected_rate`
+- `planner_selected_rate`
 - `fallback_rate`
 - `uncertainty_trigger_rate`
 - `scenario`
+- `execution_mode`
 - `data_window`
 - `model_variant`
 

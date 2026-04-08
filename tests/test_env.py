@@ -99,3 +99,28 @@ def test_history_length_is_configurable(tmp_path: Path) -> None:
     env = CometTaxiEnv(dataset, config, seed=3)
     observation = env.reset("train")
     assert observation["temporal_history"].shape[0] == 2
+
+
+def test_service_violation_uses_assignable_capacity(tmp_path: Path) -> None:
+    env = _build_env(tmp_path)
+    observation = env.reset("train")
+    demand_zone = int(np.flatnonzero(env.current_demand_vector > 0)[0])
+    for vehicle in env.vehicles[:2]:
+        vehicle.zone = demand_zone
+        vehicle.mode = 0
+        vehicle.battery_kwh = 40.0
+    observation = env._build_observation()
+    stay_actions = np.zeros(env.config.env.nmax, dtype=np.int64)
+    _, _, _, _, info = env.step(stay_actions)
+    assert info["assignable_orders"] >= 1.0
+    assert info["service_utilization_rate"] < 1.0
+    assert info["costs"]["service_violation_cost"] > 0.0
+
+    env = _build_env(tmp_path / "busy")
+    env.reset("train")
+    for vehicle in env.vehicles:
+        vehicle.mode = 1
+        vehicle.remaining_steps = 1
+    _, _, _, _, busy_info = env.step(np.zeros(env.config.env.nmax, dtype=np.int64))
+    assert busy_info["assignable_orders"] == 0.0
+    assert busy_info["costs"]["service_violation_cost"] == 0.0

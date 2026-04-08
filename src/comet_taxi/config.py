@@ -105,6 +105,8 @@ class ModelConfig:
 class TrainConfig:
     seed: int = 7
     device: str = "auto"
+    execution_mode: str = "policy_sample"
+    validation_execution_mode: str = "policy_greedy"
     total_episodes: int = 60
     rollout_episodes_per_update: int = 1
     ppo_epochs: int = 4
@@ -126,6 +128,8 @@ class TrainConfig:
 @dataclass(slots=True)
 class DomainRandomizationConfig:
     enabled: bool = True
+    curriculum_enabled: bool = False
+    phase_boundaries: list[int] = field(default_factory=lambda: [40, 120])
     demand_scale_min: float = 0.85
     demand_scale_max: float = 1.15
     travel_time_noise_min: float = 0.9
@@ -180,6 +184,9 @@ class SafetyConfig:
     service_limit: float = 0.25
     multiplier_init: float = 0.1
     multiplier_lr: float = 0.05
+    constraint_warmup_episodes: int = 20
+    multiplier_max: float = 5.0
+    multiplier_ema_decay: float = 0.9
     pid_kp: float = 1.0
     pid_ki: float = 0.1
     pid_kd: float = 0.0
@@ -191,18 +198,25 @@ class PlannerConfig:
     use_value_scoring: bool = True
     use_short_horizon_rollout: bool = False
     fallback_policy: str = "greedy"
+    enable_fallback: bool = True
     risk_trigger_soc: float = 0.18
     planner_mode: str = "planner"
     actor_prior_weight: float = 1.0
     value_weight: float = 0.1
     cost_penalty_weight: float = 0.5
     uncertainty_penalty_weight: float = 0.25
+    runtime_execution_mode: str = "planner"
+    uncertainty_warmup_episodes: int = 30
+    uncertainty_z_threshold: float = 1.5
+    actor_entropy_threshold: float = 1.25
+    action_margin_threshold: float = 0.12
 
 
 @dataclass(slots=True)
 class EvalConfig:
     standard_episodes: int = 1
     stress_episodes: int = 1
+    execution_modes: list[str] = field(default_factory=lambda: ["policy_only", "planner_runtime"])
     unseen_fleet_sizes: list[int] = field(default_factory=lambda: [16, 32, 48, 64])
     charger_outage_levels: list[float] = field(default_factory=lambda: [0.0, 0.25, 0.5])
     demand_shock_levels: list[float] = field(default_factory=lambda: [1.0, 1.25, 1.5])

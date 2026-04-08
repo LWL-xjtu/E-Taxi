@@ -38,6 +38,7 @@ EVAL_METRICS = [
     ("empty_travel_ratio", "Empty Travel Ratio"),
     ("battery_safety_rate", "Battery Safety Rate"),
     ("charging_efficiency", "Charging Efficiency"),
+    ("service_utilization_rate", "Service Utilization Rate"),
 ]
 
 CONSTRAINT_METRICS = [
@@ -47,6 +48,8 @@ CONSTRAINT_METRICS = [
 ]
 
 FALLBACK_METRICS = [
+    ("policy_selected_rate", "Policy Selected Rate"),
+    ("planner_selected_rate", "Planner Selected Rate"),
     ("fallback_rate", "Fallback Rate"),
     ("uncertainty_trigger_rate", "Uncertainty Trigger Rate"),
 ]
@@ -96,14 +99,17 @@ def plot_training_dashboard(history: pd.DataFrame, output_dir: str | Path) -> No
     if eval_columns:
         eval_history = history.dropna(subset=eval_columns, how="all")
         if not eval_history.empty:
-            fig, axes = plt.subplots(2, 3, figsize=(16, 8))
-            for axis, (metric, title) in zip(axes.flatten(), EVAL_METRICS):
+            fig, axes = plt.subplots(3, 3, figsize=(16, 10))
+            flat_axes = axes.flatten()
+            for axis, (metric, title) in zip(flat_axes, EVAL_METRICS):
                 column = f"eval_{metric}"
                 if column in eval_history.columns:
                     axis.plot(eval_history["episode"], eval_history[column], linewidth=2)
                 axis.set_title(f"Validation {title}")
                 axis.set_xlabel("Episode")
                 axis.grid(alpha=0.3)
+            for axis in flat_axes[len(EVAL_METRICS) :]:
+                axis.axis("off")
             fig.tight_layout()
             fig.savefig(output_root / "validation_dashboard.png")
             plt.close(fig)
@@ -111,13 +117,16 @@ def plot_training_dashboard(history: pd.DataFrame, output_dir: str | Path) -> No
 
 def plot_episode_summaries(summary_frame: pd.DataFrame, output_dir: str | Path, prefix: str) -> None:
     output_root = ensure_dir(output_dir)
-    fig, axes = plt.subplots(2, 3, figsize=(16, 8))
-    for axis, (metric, title) in zip(axes.flatten(), EVAL_METRICS):
+    fig, axes = plt.subplots(3, 3, figsize=(16, 10))
+    flat_axes = axes.flatten()
+    for axis, (metric, title) in zip(flat_axes, EVAL_METRICS):
         if metric in summary_frame.columns:
             axis.plot(summary_frame["episode"], summary_frame[metric], marker="o", linewidth=2)
         axis.set_title(title)
         axis.set_xlabel("Episode")
         axis.grid(alpha=0.3)
+    for axis in flat_axes[len(EVAL_METRICS) :]:
+        axis.axis("off")
     fig.tight_layout()
     fig.savefig(output_root / f"{prefix}_episode_dashboard.png")
     plt.close(fig)
@@ -134,7 +143,19 @@ def build_eval_comparison(
     for label, eval_dir in zip(resolved_labels, eval_dirs):
         metrics_frame = _load_csv(Path(eval_dir) / "metrics.csv")
         for _, row in metrics_frame.iterrows():
-            record = {"label": label, "scenario": row.get("scenario", "standard_test")}
+            execution_mode = str(row.get("execution_mode", "")).strip()
+            display_label = label
+            if execution_mode == "policy_only":
+                display_label = f"{label}-policy"
+            elif execution_mode == "planner_runtime":
+                display_label = f"{label}-runtime"
+            elif execution_mode == "greedy":
+                display_label = label
+            record = {
+                "label": display_label,
+                "scenario": row.get("scenario", "standard_test"),
+                "execution_mode": execution_mode or "unknown",
+            }
             for metric, _ in EVAL_METRICS + CONSTRAINT_METRICS + FALLBACK_METRICS:
                 record[metric] = float(row.get(metric, 0.0))
             records.append(record)
@@ -142,13 +163,16 @@ def build_eval_comparison(
     comparison = pd.DataFrame(records)
     comparison.to_csv(output_root / "comparison_metrics.csv", index=False)
 
-    fig, axes = plt.subplots(2, 3, figsize=(16, 8))
-    for axis, (metric, title) in zip(axes.flatten(), EVAL_METRICS):
+    fig, axes = plt.subplots(3, 3, figsize=(16, 10))
+    flat_axes = axes.flatten()
+    for axis, (metric, title) in zip(flat_axes, EVAL_METRICS):
         standard = comparison[comparison["scenario"] == "standard_test"]
         axis.bar(standard["label"], standard[metric])
         axis.set_title(title)
         axis.tick_params(axis="x", rotation=20)
         axis.grid(alpha=0.2, axis="y")
+    for axis in flat_axes[len(EVAL_METRICS) :]:
+        axis.axis("off")
     fig.tight_layout()
     fig.savefig(output_root / "comparison_dashboard.png")
     plt.close(fig)
@@ -184,13 +208,16 @@ def plot_constraint_dashboard(comparison: pd.DataFrame, output_dir: str | Path) 
 
 def plot_fallback_dashboard(comparison: pd.DataFrame, output_dir: str | Path) -> None:
     output_root = ensure_dir(output_dir)
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    for axis, (metric, title) in zip(axes, FALLBACK_METRICS):
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    flat_axes = axes.flatten()
+    for axis, (metric, title) in zip(flat_axes, FALLBACK_METRICS):
         if metric in comparison.columns:
             axis.bar(comparison["label"], comparison[metric])
         axis.set_title(title)
         axis.tick_params(axis="x", rotation=20)
         axis.grid(alpha=0.2, axis="y")
+    for axis in flat_axes[len(FALLBACK_METRICS) :]:
+        axis.axis("off")
     fig.tight_layout()
     fig.savefig(output_root / "fallback_dashboard.png")
     plt.close(fig)

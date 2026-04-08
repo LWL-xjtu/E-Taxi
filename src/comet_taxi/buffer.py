@@ -18,6 +18,7 @@ class RolloutBatch:
     action_mask: torch.Tensor
     actions: torch.Tensor
     old_log_probs: torch.Tensor
+    costs: torch.Tensor
     returns: torch.Tensor
     advantages: torch.Tensor
     cost_returns: torch.Tensor
@@ -141,6 +142,7 @@ class RolloutBuffer:
             old_log_probs=torch.as_tensor(
                 np.stack(self.log_probs), dtype=torch.float32, device=device
             ),
+            costs=torch.as_tensor(cost_matrix, dtype=torch.float32, device=device),
             returns=torch.as_tensor(returns, dtype=torch.float32, device=device),
             advantages=torch.as_tensor(advantages, dtype=torch.float32, device=device),
             cost_returns=torch.as_tensor(cost_returns, dtype=torch.float32, device=device),

@@ -19,7 +19,7 @@ from .config import ExperimentConfig
 from .env import CometTaxiEnv
 from .models import COMETActor, COMETActorV2, CostCritic, EnsembleCritic, ObservationNormalizer
 from .planner import CandidatePlanner
-from .runtime import action_selection_from_policy, resolve_device
+from .runtime import UncertaintyCalibrator, action_selection_from_policy, resolve_device
 from .utils import ensure_dir
 
 
@@ -30,6 +30,7 @@ def evaluate_policy(
     episodes: int,
     scenario_name: str = "standard",
     scenario: dict[str, float] | None = None,
+    execution_mode: str = "policy_only",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     summaries: list[dict[str, float | int | str]] = []
     for episode in range(episodes):
@@ -38,7 +39,12 @@ def evaluate_policy(
         while not done:
             actions = select_actions(observation)
             observation, _, _, done, info = env.step(actions)
-        summary = {"episode": episode + 1, "scenario": scenario_name, **info}
+        summary = {
+            "episode": episode + 1,
+            "scenario": scenario_name,
+            "execution_mode": execution_mode,
+            **info,
+        }
         if "costs" in summary:
             for key, value in dict(summary["costs"]).items():
                 summary[key] = value
@@ -52,6 +58,7 @@ def evaluate_policy(
                 "split": split,
                 "episodes": episodes,
                 "scenario": scenario_name,
+                "execution_mode": execution_mode,
                 **summary_frame.drop(columns=["episode"]).mean(numeric_only=True).to_dict(),
             }
         ]
@@ -121,40 +128,56 @@ def evaluate_checkpoint(
     if normalizer is not None and checkpoint.get("normalizer_state_dict"):
         normalizer.load_state_dict(checkpoint["normalizer_state_dict"])
         normalizer.to(device)
+    uncertainty_calibrator = UncertaintyCalibrator()
+    uncertainty_calibrator.load_state_dict(checkpoint.get("uncertainty_calibrator_state_dict"))
 
-    def select_actions(observation: dict[str, object]) -> object:
-        actions, _, planner_info = action_selection_from_policy(
-            actor,
-            observation,
-            device,
-            critic=critic,
-            cost_critic=cost_critic,
-            planner=planner,
-            env=env,
-            normalizer=normalizer,
-            planner_enabled=config.online_finetune.planner_enabled,
-        )
-        env.register_runtime_feedback(
-            fallback_count=int(np.asarray(planner_info["fallback_mask"]).sum()),
-            uncertainty_count=int(np.asarray(planner_info["uncertainty_mask"]).sum()),
-            planner_steps=int(np.asarray(observation["agent_mask"]).sum()),
-        )
-        return actions
+    def build_selector(execution_mode: str) -> Callable[[dict[str, object]], object]:
+        internal_mode = "planner" if execution_mode == "planner_runtime" else "policy_greedy"
+
+        def select_actions(observation: dict[str, object]) -> object:
+            actions, _, planner_info = action_selection_from_policy(
+                actor,
+                observation,
+                device,
+                critic=critic,
+                cost_critic=cost_critic,
+                planner=planner,
+                env=env,
+                normalizer=normalizer,
+                planner_enabled=config.online_finetune.planner_enabled,
+                execution_mode=internal_mode,
+                uncertainty_calibrator=uncertainty_calibrator,
+                current_episode=max(config.planner.uncertainty_warmup_episodes + 1, 1),
+            )
+            env.register_runtime_feedback(
+                policy_count=int(np.asarray(planner_info["policy_selected_mask"]).sum()),
+                planner_count=int(np.asarray(planner_info["planner_selected_mask"]).sum()),
+                fallback_count=int(np.asarray(planner_info["fallback_mask"]).sum()),
+                uncertainty_count=int(np.asarray(planner_info["uncertainty_mask"]).sum()),
+                decision_steps=int(np.asarray(observation["agent_mask"]).sum()),
+            )
+            return actions
+
+        return select_actions
 
     scenario_specs = build_stress_scenarios(config) if stress else [("standard_test", {})]
+    execution_modes = config.evaluation.execution_modes if config.model.variant != "legacy" else ["policy_only"]
     metrics_frames: list[pd.DataFrame] = []
     summary_frames: list[pd.DataFrame] = []
-    for scenario_name, scenario in scenario_specs:
-        metrics_frame, summary_frame = evaluate_policy(
-            env,
-            select_actions,
-            split,
-            episodes,
-            scenario_name=scenario_name,
-            scenario=scenario,
-        )
-        metrics_frames.append(metrics_frame)
-        summary_frames.append(summary_frame)
+    for execution_mode in execution_modes:
+        selector = build_selector(execution_mode)
+        for scenario_name, scenario in scenario_specs:
+            metrics_frame, summary_frame = evaluate_policy(
+                env,
+                selector,
+                split,
+                episodes,
+                scenario_name=scenario_name,
+                scenario=scenario,
+                execution_mode=execution_mode,
+            )
+            metrics_frames.append(metrics_frame)
+            summary_frames.append(summary_frame)
     metrics_frame = pd.concat(metrics_frames, ignore_index=True)
     summary_frame = pd.concat(summary_frames, ignore_index=True)
     metrics_frame["data_window"] = _data_window_label(env)
@@ -185,6 +208,7 @@ def evaluate_greedy(
             episodes,
             scenario_name=scenario_name,
             scenario=scenario,
+            execution_mode="greedy",
         )
         metrics_frames.append(metrics_frame)
         summary_frames.append(summary_frame)

@@ -104,9 +104,11 @@ class CometTaxiEnv:
         self.metrics: dict[str, float] = {}
         self.last_info: dict[str, Any] = {}
         self.pending_runtime_feedback = {
+            "policy_count": 0.0,
+            "planner_count": 0.0,
             "fallback_count": 0.0,
             "uncertainty_count": 0.0,
-            "planner_steps": 0.0,
+            "decision_steps": 0.0,
         }
         self.done = False
         self.history_len = self.config.temporal.history_len
@@ -119,6 +121,13 @@ class CometTaxiEnv:
         )
         self.charger_occupancy = np.zeros(self.charge_station_count, dtype=np.float32)
         self.charger_queue = np.zeros(self.charge_station_count, dtype=np.float32)
+        self.current_training_episode = 0
+        self.current_total_episodes = max(self.config.train.total_episodes, 1)
+        self.curriculum_cap = 1.0
+        self.current_eligible_idle_agents = 0.0
+        self.current_assignable_orders = 0.0
+        self.current_orders_served_step = 0.0
+        self.current_service_utilization = 1.0
 
     def _load_zone_neighbors(self) -> np.ndarray:
         raw_neighbors = self.dataset.metadata.get("mapping", {}).get("zone_neighbors", {})
@@ -198,15 +207,46 @@ class CometTaxiEnv:
             return str(self.rng.choice(available_days))
         return available_days[0]
 
+    def set_training_progress(
+        self,
+        episode: int,
+        total_episodes: int,
+        curriculum_cap: float = 1.0,
+    ) -> None:
+        self.current_training_episode = max(int(episode), 0)
+        self.current_total_episodes = max(int(total_episodes), 1)
+        self.curriculum_cap = float(np.clip(curriculum_cap, 0.0, 1.0))
+
+    def _curriculum_strength(self) -> float:
+        if not self.config.domain_randomization.curriculum_enabled:
+            return 1.0
+        first_boundary, second_boundary = self.config.domain_randomization.phase_boundaries[:2]
+        episode = max(self.current_training_episode, 1)
+        if episode <= first_boundary:
+            strength = 0.35
+        elif episode <= second_boundary:
+            strength = 0.70
+        else:
+            strength = 1.0
+        return float(strength * self.curriculum_cap)
+
     def _sample_vehicle_count(self, scenario: dict[str, float] | None = None) -> int:
         if scenario and "active_agents" in scenario:
             return int(scenario["active_agents"])
-        return int(
-            self.rng.integers(
-                self.config.env.min_active_agents,
-                self.config.env.max_active_agents + 1,
-            )
-        )
+        min_agents = self.config.env.min_active_agents
+        max_agents = self.config.env.max_active_agents
+        if self.current_split == "train" and self.config.domain_randomization.curriculum_enabled:
+            easy_low = min_agents + int(round((max_agents - min_agents) * 0.30))
+            easy_high = min_agents + int(round((max_agents - min_agents) * 0.50))
+            strength = self._curriculum_strength()
+            lower = int(round(easy_low + (min_agents - easy_low) * strength))
+            upper = int(round(easy_high + (max_agents - easy_high) * strength))
+            lower = max(min_agents, min(lower, max_agents))
+            upper = max(lower, min(upper, max_agents))
+        else:
+            lower = min_agents
+            upper = max_agents
+        return int(self.rng.integers(lower, upper + 1))
 
     def _build_scenario(self, split: str, overrides: dict[str, float] | None = None) -> dict[str, float]:
         overrides = overrides or {}
@@ -224,17 +264,35 @@ class CometTaxiEnv:
                 "event_scale": 1.0,
             }
         else:
+            strength = self._curriculum_strength()
+            def scaled_range(low: float, high: float) -> tuple[float, float]:
+                return (
+                    1.0 + strength * (float(low) - 1.0),
+                    1.0 + strength * (float(high) - 1.0),
+                )
+
+            demand_low, demand_high = scaled_range(dr.demand_scale_min, dr.demand_scale_max)
+            travel_low, travel_high = scaled_range(dr.travel_time_noise_min, dr.travel_time_noise_max)
+            price_low, price_high = scaled_range(dr.charge_price_scale_min, dr.charge_price_scale_max)
+            charger_low, charger_high = scaled_range(
+                dr.charger_capacity_scale_min,
+                dr.charger_capacity_scale_max,
+            )
             peak_scale = 1.0
-            if self.rng.random() < dr.peak_shock_probability:
-                peak_scale = float(self.rng.uniform(dr.peak_shock_scale_min, dr.peak_shock_scale_max))
+            peak_probability = dr.peak_shock_probability * strength
+            if self.rng.random() < peak_probability:
+                peak_low, peak_high = scaled_range(dr.peak_shock_scale_min, dr.peak_shock_scale_max)
+                peak_scale = float(self.rng.uniform(peak_low, peak_high))
             event_scale = 1.0
-            if self.rng.random() < dr.event_day_probability:
-                event_scale = float(self.rng.uniform(dr.event_day_scale_min, dr.event_day_scale_max))
+            event_probability = dr.event_day_probability * strength
+            if self.rng.random() < event_probability:
+                event_low, event_high = scaled_range(dr.event_day_scale_min, dr.event_day_scale_max)
+                event_scale = float(self.rng.uniform(event_low, event_high))
             scenario = {
-                "demand_scale": float(self.rng.uniform(dr.demand_scale_min, dr.demand_scale_max)),
-                "travel_noise": float(self.rng.uniform(dr.travel_time_noise_min, dr.travel_time_noise_max)),
-                "charge_price_scale": float(self.rng.uniform(dr.charge_price_scale_min, dr.charge_price_scale_max)),
-                "charger_capacity_scale": float(self.rng.uniform(dr.charger_capacity_scale_min, dr.charger_capacity_scale_max)),
+                "demand_scale": float(self.rng.uniform(demand_low, demand_high)),
+                "travel_noise": float(self.rng.uniform(travel_low, travel_high)),
+                "charge_price_scale": float(self.rng.uniform(price_low, price_high)),
+                "charger_capacity_scale": float(self.rng.uniform(charger_low, charger_high)),
                 "peak_shock_scale": peak_scale,
                 "event_scale": event_scale,
             }
@@ -253,14 +311,18 @@ class CometTaxiEnv:
 
     def register_runtime_feedback(
         self,
+        policy_count: int = 0,
+        planner_count: int = 0,
         fallback_count: int = 0,
         uncertainty_count: int = 0,
-        planner_steps: int = 0,
+        decision_steps: int = 0,
     ) -> None:
         self.pending_runtime_feedback = {
+            "policy_count": float(policy_count),
+            "planner_count": float(planner_count),
             "fallback_count": float(fallback_count),
             "uncertainty_count": float(uncertainty_count),
-            "planner_steps": float(planner_steps),
+            "decision_steps": float(decision_steps),
         }
 
     def _sample_zone(self) -> int:
@@ -303,10 +365,16 @@ class CometTaxiEnv:
         self.charger_occupancy.fill(0.0)
         self.charger_queue.fill(0.0)
         self.temporal_history.fill(0.0)
+        self.current_eligible_idle_agents = 0.0
+        self.current_assignable_orders = 0.0
+        self.current_orders_served_step = 0.0
+        self.current_service_utilization = 1.0
         self.pending_runtime_feedback = {
+            "policy_count": 0.0,
+            "planner_count": 0.0,
             "fallback_count": 0.0,
             "uncertainty_count": 0.0,
-            "planner_steps": 0.0,
+            "decision_steps": 0.0,
         }
         self.metrics = {
             "orders_available": 0.0,
@@ -324,9 +392,14 @@ class CometTaxiEnv:
             "battery_violation_cost_sum": 0.0,
             "charger_overflow_cost_sum": 0.0,
             "service_violation_cost_sum": 0.0,
+            "service_utilization_sum": 0.0,
+            "assignable_orders_sum": 0.0,
+            "eligible_idle_agents_sum": 0.0,
+            "policy_selected_count": 0.0,
+            "planner_selected_count": 0.0,
             "uncertainty_count": 0.0,
             "fallback_count": 0.0,
-            "planner_steps": 0.0,
+            "decision_steps": 0.0,
             "initial_agents": float(active_count),
         }
         self._refresh_orders()
@@ -459,6 +532,16 @@ class CometTaxiEnv:
             self.remaining_orders.pop(pickup_zone, None)
         self.current_demand_vector[pickup_zone] = max(0.0, self.current_demand_vector[pickup_zone] - 1.0)
         return order
+
+    def _compute_service_capacity(self) -> tuple[float, float]:
+        eligible_idle_agents = 0.0
+        for vehicle in self.vehicles:
+            if not vehicle.alive or vehicle.mode != MODE_IDLE:
+                continue
+            if self.current_demand_vector[vehicle.zone] > 0:
+                eligible_idle_agents += 1.0
+        assignable_orders = min(float(self.current_orders_available), eligible_idle_agents)
+        return eligible_idle_agents, assignable_orders
 
     def _action_mask_for_vehicle(self, vehicle: VehicleState) -> np.ndarray:
         mask = np.zeros(ACTION_DIM, dtype=np.float32)
@@ -645,6 +728,7 @@ class CometTaxiEnv:
                     - float(order["trip_distance_km"]) * self.config.env.energy_per_km,
                 )
                 self.metrics["orders_served"] += 1.0
+                self.current_orders_served_step += 1.0
                 self.metrics["profit_total"] += float(order["revenue_amount"])
             else:
                 efficiency_penalty += self.config.env.idle_penalty
@@ -737,7 +821,12 @@ class CometTaxiEnv:
             float(self._effective_charger_capacity() * max(len(self.charge_stations), 1)),
             1.0,
         )
-        service_cost = float(self.current_demand_vector.sum()) / max(self.current_orders_available, 1.0)
+        if self.current_assignable_orders <= 0:
+            service_utilization = 1.0
+        else:
+            service_utilization = float(self.current_orders_served_step) / max(self.current_assignable_orders, 1.0)
+        self.current_service_utilization = float(np.clip(service_utilization, 0.0, 1.0))
+        service_cost = 1.0 - self.current_service_utilization
         costs = {
             "battery_violation_cost": battery_cost,
             "charger_overflow_cost": charger_cost,
@@ -746,6 +835,9 @@ class CometTaxiEnv:
         self.metrics["battery_violation_cost_sum"] += costs["battery_violation_cost"]
         self.metrics["charger_overflow_cost_sum"] += costs["charger_overflow_cost"]
         self.metrics["service_violation_cost_sum"] += costs["service_violation_cost"]
+        self.metrics["service_utilization_sum"] += self.current_service_utilization
+        self.metrics["assignable_orders_sum"] += self.current_assignable_orders
+        self.metrics["eligible_idle_agents_sum"] += self.current_eligible_idle_agents
         return costs
 
     def _build_aux_targets(self, done: bool) -> dict[str, np.ndarray | float]:
@@ -813,6 +905,8 @@ class CometTaxiEnv:
             )
 
         per_agent_rewards = np.zeros(self.config.env.nmax, dtype=np.float32)
+        self.current_orders_served_step = 0.0
+        self.current_eligible_idle_agents, self.current_assignable_orders = self._compute_service_capacity()
         for slot_index, vehicle_index in enumerate(self.slot_to_vehicle):
             if vehicle_index >= len(self.vehicles):
                 continue
@@ -839,13 +933,17 @@ class CometTaxiEnv:
         self.metrics["team_reward_sum"] += team_reward
         self.metrics["real_agent_steps"] += float(self.agent_mask.sum())
         self.metrics["episode_steps"] += 1.0
+        self.metrics["policy_selected_count"] += self.pending_runtime_feedback["policy_count"]
+        self.metrics["planner_selected_count"] += self.pending_runtime_feedback["planner_count"]
         self.metrics["fallback_count"] += self.pending_runtime_feedback["fallback_count"]
         self.metrics["uncertainty_count"] += self.pending_runtime_feedback["uncertainty_count"]
-        self.metrics["planner_steps"] += self.pending_runtime_feedback["planner_steps"]
+        self.metrics["decision_steps"] += self.pending_runtime_feedback["decision_steps"]
         self.pending_runtime_feedback = {
+            "policy_count": 0.0,
+            "planner_count": 0.0,
             "fallback_count": 0.0,
             "uncertainty_count": 0.0,
-            "planner_steps": 0.0,
+            "decision_steps": 0.0,
         }
 
         self.current_step += 1
@@ -872,7 +970,7 @@ class CometTaxiEnv:
         initial_vehicle_count = max(float(self.metrics["initial_agents"]), 1.0)
         charge_need_steps = max(self.metrics["charge_need_steps"], 1.0)
         real_agent_steps = max(self.metrics["real_agent_steps"], 1.0)
-        planner_steps = max(self.metrics["planner_steps"], 1.0)
+        decision_steps = max(self.metrics["decision_steps"], 1.0)
         battery_violation_events = self.metrics["low_battery_violations"] + self.metrics["dead_vehicles"]
         return {
             "order_completion_rate": self.metrics["orders_served"] / orders_available,
@@ -885,10 +983,15 @@ class CometTaxiEnv:
             "mean_team_reward": self.metrics["team_reward_sum"] / max(self.metrics["episode_steps"], 1.0),
             "orders_available": self.metrics["orders_available"],
             "orders_served": self.metrics["orders_served"],
+            "eligible_idle_agents": self.current_eligible_idle_agents,
+            "assignable_orders": self.current_assignable_orders,
+            "service_utilization_rate": self.metrics["service_utilization_sum"] / max(self.metrics["episode_steps"], 1.0),
             "battery_violation_rate": self.metrics["battery_violation_cost_sum"] / max(self.metrics["episode_steps"], 1.0),
             "charger_overflow_rate": self.metrics["charger_overflow_cost_sum"] / max(self.metrics["episode_steps"], 1.0),
             "service_violation_rate": self.metrics["service_violation_cost_sum"] / max(self.metrics["episode_steps"], 1.0),
-            "fallback_rate": self.metrics["fallback_count"] / planner_steps,
-            "uncertainty_trigger_rate": self.metrics["uncertainty_count"] / planner_steps,
+            "policy_selected_rate": self.metrics["policy_selected_count"] / decision_steps,
+            "planner_selected_rate": self.metrics["planner_selected_count"] / decision_steps,
+            "fallback_rate": self.metrics["fallback_count"] / decision_steps,
+            "uncertainty_trigger_rate": self.metrics["uncertainty_count"] / decision_steps,
             "costs": costs,
         }
