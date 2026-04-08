@@ -19,7 +19,7 @@ from .trainer import CometTrainer
 
 
 def prepare_nyc_main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare the NYC TLC small-sample dataset.")
+    parser = argparse.ArgumentParser(description="Prepare NYC TLC data for COMET / COMET-v2.")
     parser.add_argument("--config", default="configs/base.toml")
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
@@ -39,10 +39,16 @@ def train_main() -> None:
     parser.add_argument("--config", default="configs/base.toml")
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--resume-checkpoint")
     args = parser.parse_args()
 
     config = load_experiment_config(args.config)
-    trainer = CometTrainer(config, args.data_dir, args.output_dir)
+    trainer = CometTrainer(
+        config,
+        args.data_dir,
+        args.output_dir,
+        resume_checkpoint=args.resume_checkpoint,
+    )
     trainer.train()
 
 

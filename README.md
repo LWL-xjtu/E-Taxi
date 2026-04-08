@@ -1,89 +1,98 @@
-# COMET-v2 Taxi：基于真实 NYC TLC 数据驱动的多智能体电动出租车调度原型
+﻿# COMET-v2 Taxi：面向真实 NYC TLC 数据的单模型强泛化训练框架
 
 ## 1. 项目简介
 
-本项目是一个 **COMET-v2 风格** 的多智能体强化学习（MARL）电动出租车调度原型，核心目标是：
+本项目是一个基于真实 **NYC TLC Yellow Taxi** 数据集构建的多智能体强化学习（MARL）E-Taxi 调度原型。当前默认主线是 **COMET-v2 单模型强泛化训练**：
 
-- 使用 **真实 NYC TLC Yellow Taxi** 月度订单数据驱动仿真，而不是只用静态统计表或手工合成环境。
-- 在同一套环境中保留 **shared actor、ghost + mask、centralized critic、planner / uncertainty gate / fallback** 这些 COMET 系统思想。
-- 支持并方便验证 **训练时 10 个智能体、测试时 15 个智能体** 的数量泛化实验。
-- 让项目能直接部署到 **Linux + A100** 服务器上跑训练、评估和可视化。
+- 使用真实 trip 级订单，而不是静态手工需求表。
+- 用共享 Actor 处理任意一辆同类车辆的决策。
+- 用 ghost + mask 处理动态智能体数量。
+- 用可学习车队编码器替代“人工群体摘要为主”的旧路径。
+- 用时间趋势编码器显式建模最近若干步需求、价格、拥堵和时延变化。
+- 用 planner + uncertainty gate + greedy fallback 组成运行时决策链路。
+- 用单个 checkpoint 评估不同数量智能体、不同环境扰动下的泛化能力。
 
-当前仓库默认走 **COMET-v2** 路径，但仍保留 legacy 路径，不会破坏已有 CLI 主入口。
+当前正式训练默认使用 3 个月真实 TLC 数据：
+
+- `data/raw/yellow_tripdata_2025-12.parquet`
+- `data/raw/yellow_tripdata_2026-01.parquet`
+- `data/raw/yellow_tripdata_2026-02.parquet`
+
+推荐部署环境是 **Linux + A100**，默认配置按“单卡 A100、约 24 小时内完成一版正式训练”来设置。
 
 ## 2. 模型结构概述
 
 ### 2.1 单车局部状态
 
-每个智能体的局部观测至少包含：
+每辆车的局部观测至少包括：
 
-- 当前区域（TLC zone，内部编码为 `0..262`，输入网络时用 `zone_id + 1`）
+- 当前区域 ID
 - 电量挡位 one-hot
-- 连续电量比例 `battery_ratio`
+- 连续电量值 / 比例
 - 当前模式（idle / serving / charging / repositioning）
 - 剩余服务步数
 
 ### 2.2 车队编码器
 
-项目不再把手工 `fleet_signature` 当成唯一主表达，而是把它降级为 side / skip feature。现在主车队表示来自：
+当前主路径不再把 `fleet_signature` 当成唯一全局表示，而是采用：
 
 1. `VehicleTokenEncoder`
    把每辆车的局部状态编码成 token。
 
 2. `FleetSetEncoder`
-   把所有真实智能体 token 通过 **permutation-invariant** 的集合编码器聚合成 `fleet_context`。
+   用 permutation-invariant 的集合编码器把所有真实车辆 token 聚合为 `fleet_context`。
 
 支持两种模式：
 
 - `deepsets`
 - `set_transformer`
 
-这样做的动机不是单纯为了让输入维度固定，而是为了让策略学习：
+之所以这样设计，不是为了“凑固定输入维度”，而是为了让策略学到：
 
-> “任意一辆同类智能体，在给定自身局部状态、车队上下文和最近历史趋势的条件下，应该如何决策。”
+> 任意一辆同类车辆，在给定自身局部状态、车队上下文和最近历史趋势的条件下，应该如何决策。
 
-这也是当前仓库回答 `10训15测` 数量泛化问题的核心结构支撑。
+这也是单模型在不同智能体数量下保持泛化能力的核心结构原因。
 
 ### 2.3 时间趋势编码器
 
-`TemporalEncoder` 默认支持：
+`TemporalEncoder` 支持：
 
 - `gru`
 - `transformer`
 
-它编码最近 `K` 步历史信号，包括：
+它编码最近 `K` 步历史，至少包含：
 
 - demand history
 - charge price history
 - charger occupancy / queue history
 - delay / travel-time residual history
 
-环境中维护统一的历史缓冲区，训练、评估和运行时都走同一条 temporal path。
+训练、评估、在线决策统一使用同一条 temporal path。
 
 ### 2.4 Planner / Uncertainty / Fallback
 
-运行时不再是“policy logits 直接采样作为最终动作”。默认流程是：
+运行时不是“policy logits 直接采样 = 最终动作”，而是：
 
 1. 生成候选动作
-2. 用 actor logits 作为 prior
+2. 用 actor logits 提供 prior
 3. 用 reward critic 打分
-4. 用 cost critics 加惩罚
+4. 用 cost critics 施加约束惩罚
 5. 用 critic ensemble variance 作为不确定性 proxy
 6. 超过阈值时触发 uncertainty gate
-7. 走 `GreedyDispatchPolicy` fallback
+7. 退回 `GreedyDispatchPolicy` fallback
 
-评估指标中会持续记录：
+评估指标里会持续记录：
 
 - `fallback_rate`
 - `uncertainty_trigger_rate`
 
 ### 2.5 Ghost + Mask
 
-这里要明确区分三个概念：
+请明确区分：
 
-- `nmax`：张量上限，只是为了 batch 化
-- `active_agents`：当前回合真实在线车辆数
-- `agent_mask`：哪些 slot 是真实车辆，哪些 slot 是 ghost
+- `nmax`：张量上限，只是为了 batch 对齐
+- `active_agents`：当前真实在线车辆数
+- `agent_mask`：哪个 slot 是真实车，哪个 slot 是 ghost
 
 当前代码中以下路径都显式使用 `agent_mask`：
 
@@ -95,42 +104,33 @@
 - loss 计算
 - metric logging
 
-因此：
-
-- 训练时可以设置 `nmax = 16, active_agents = 10`
-- 评估时可以设置 `nmax = 16, active_agents = 15`
-- 输入张量 shape 保持兼容，但真实有效智能体数量发生变化
+因此，训练和评估可以在 **不同智能体数量** 下保持输入张量兼容。
 
 ## 3. 为什么要用真实 NYC TLC 数据驱动仿真
 
-当前环境不再只依赖静态 demand summary，而是直接使用 **真实 trip 级订单** 作为需求引擎：
+当前环境不是只依赖静态统计摘要，而是直接用真实 trip 级订单驱动：
 
-- 每天随机抽取真实日期
 - 以 `tpep_pickup_datetime` 为基准
 - 每 10 分钟推进一步
 - 从当前 `time_bin` 的真实订单池中分配订单
-- 使用真实 `trip_distance`、`fare_amount / total_amount`、`PULocationID`、`DOLocationID`
+- 使用真实 `trip_distance` 扣减电量
+- 使用真实 `fare_amount / total_amount` 作为收入
+- 使用真实 `DOLocationID` 更新服务后位置
 
-这比“先聚合成一张静态统计表再做简单采样”更适合做导师汇报，因为它能明确回答：
+预处理阶段会做这些清洗：
 
-- 真实订单流是怎么进入环境的
-- 为什么环境里的收益、距离、时间、充电需求有现实依据
-- 为什么 `10训15测` 的结果不是建立在过度理想化的玩具环境上
-
-当前实现对真实 TLC 数据做了这些处理：
-
-- 删除 `dropoff <= pickup` 的异常订单
+- 删除 `tpep_dropoff_datetime <= tpep_pickup_datetime`
 - 删除 `fare_amount <= 0`
 - 删除 `trip_distance <= 0`
 - 删除 `PULocationID / DOLocationID` 不在 `1..263` 的记录
-- 将 `trip_distance` 转成公里，用于电量消耗
-- 保留真实收入 `total_amount`（若缺失则退回 `fare_amount`）
+
+这样训练和评估更接近真实订单流，也更适合做汇报和正式实验。
 
 ## 4. Linux / A100 服务器安装步骤
 
-以下命令默认你已经进入项目根目录。
+以下命令默认在项目根目录执行。
 
-### 4.1 创建虚拟环境
+### 4.1 创建环境
 
 ```bash
 python3 -m venv .venv
@@ -140,15 +140,15 @@ python -m pip install --upgrade pip
 
 ### 4.2 安装 CUDA 版 PyTorch
 
-如果服务器是 CUDA 12.1：
+如果服务器使用 CUDA 12.1：
 
 ```bash
 pip install --index-url https://download.pytorch.org/whl/cu121 torch
 ```
 
-如果你使用别的 CUDA 版本，请按服务器上的 CUDA 版本改 PyTorch 下载源。
+如果你的服务器 CUDA 版本不同，请按实际 CUDA 版本更换 PyTorch 下载源。
 
-### 4.3 安装项目依赖与 CLI
+### 4.3 安装项目与 CLI
 
 ```bash
 pip install -r requirements-dev.txt
@@ -165,272 +165,249 @@ which run_greedy_baseline
 which visualize_results
 ```
 
-### 4.5 检查 GPU 是否可用
+### 4.5 检查 GPU
 
 ```bash
 python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no-gpu')"
 ```
 
-### 4.6 关于 `device = auto`
+### 4.6 关于 `device = "auto"`
 
-配置里默认使用：
+默认配置使用：
 
 ```toml
 [train]
 device = "auto"
 ```
 
-这意味着：
+含义是：
 
-- 如果检测到 CUDA，就自动使用 GPU
+- 检测到 CUDA 时自动使用 GPU
 - 在 A100 服务器上通常会自动切到 `cuda`
-- 在本地 CPU 环境下也能跑测试和 smoke
+- 在 CPU 环境下也能跑测试和 smoke
 
-### 4.7 推荐后台运行方式
+### 4.7 推荐后台运行
 
 使用 `nohup`：
 
 ```bash
-nohup train --config configs/real_nyc_2026.toml --data-dir data/processed/nyc_real_2026 --output-dir outputs/comet_v2_run > outputs/comet_v2_run/train.log 2>&1 &
+mkdir -p outputs/formal_generalist_run
+nohup train --config configs/formal_generalist.toml --data-dir data/processed/nyc_formal_q1 --output-dir outputs/formal_generalist_run > outputs/formal_generalist_run/train.log 2>&1 &
 ```
 
 查看日志：
 
 ```bash
-tail -f outputs/comet_v2_run/train.log
+tail -f outputs/formal_generalist_run/train.log
 ```
 
 或者使用 `tmux`：
 
 ```bash
-tmux new -s comet_train
-train --config configs/real_nyc_2026.toml --data-dir data/processed/nyc_real_2026 --output-dir outputs/comet_v2_run
+tmux new -s comet_generalist
+train --config configs/formal_generalist.toml --data-dir data/processed/nyc_formal_q1 --output-dir outputs/formal_generalist_run
 ```
 
 ### 4.8 终端粘贴提醒
 
-从网页复制命令到终端时，不要把 bracketed paste 控制字符一起粘进去；如果你发现命令前后出现异常控制符，请删掉后重新输入。
+不要把网页复制时混入的 bracketed paste 控制字符一起粘进终端。如果你看到命令前后出现异常控制符，请删除后重新输入。
 
 ## 5. 数据集准备
 
-本项目默认使用 **NYC TLC Yellow Taxi** 数据。
+当前正式训练默认使用这 3 个文件：
 
-### 5.1 推荐文件名
+- `data/raw/yellow_tripdata_2025-12.parquet`
+- `data/raw/yellow_tripdata_2026-01.parquet`
+- `data/raw/yellow_tripdata_2026-02.parquet`
 
-```bash
-yellow_tripdata_2026-01.parquet
-```
-
-### 5.2 原始数据放置目录
-
-请把数据放到：
-
-```bash
-data/raw/yellow_tripdata_2026-01.parquet
-```
-
-推荐先建目录：
+推荐目录结构：
 
 ```bash
 mkdir -p data/raw data/processed outputs
+ls data/raw/yellow_tripdata_2025-12.parquet
 ls data/raw/yellow_tripdata_2026-01.parquet
+ls data/raw/yellow_tripdata_2026-02.parquet
 ```
 
-### 5.3 预处理输出目录示例
+`prepare_nyc` 现在支持把 `--input` 直接指向目录 `data/raw/`，会自动按文件名顺序读取目录下的 `yellow_tripdata_*.parquet`。
 
-真实数据的预处理输出建议放到：
+## 6. 数据预处理
+
+正式训练推荐输出目录：
+
+- `data/processed/nyc_formal_q1`
+
+运行：
 
 ```bash
-data/processed/nyc_real_2026
+prepare_nyc --config configs/formal_generalist.toml --input data/raw --output data/processed/nyc_formal_q1
 ```
 
-`prepare_nyc` 会输出：
+预处理产物：
 
 - `train.parquet`
 - `val.parquet`
 - `test.parquet`
 - `metadata.json`
 
-其中：
+当前正式配置会按日期顺序切分：
 
-- `train/val/test.parquet` 是 **订单级** 数据，不再只是静态 demand 汇总表
-- `metadata.json` 保存 demand summary、OD summary、trip distance / duration / fare summary、zone neighbors、charge station 初始化信息等
+- train = 70 天
+- val = 10 天
+- test = 10 天
 
-## 6. 数据预处理步骤
+`metadata.json` 会额外保存：
 
-### 6.1 常规真实数据预处理
+- `source_files`
+- `source_months`
+- `available_days`
+- `split_day_counts`
+- `split_date_ranges`
+- demand / OD / fare / trip summary
+- zone neighbors
+- charge stations
 
-```bash
-prepare_nyc --config configs/real_nyc_2026.toml --input data/raw/yellow_tripdata_2026-01.parquet --output data/processed/nyc_real_2026
-```
+## 7. Smoke Test
 
-### 6.2 `10训15测` 专用预处理
-
-```bash
-prepare_nyc --config configs/ten_to_fifteen_real.toml --input data/raw/yellow_tripdata_2026-01.parquet --output data/processed/ten15_real
-```
-
-## 7. Smoke Test 指令
-
-如果你想先确认链路是通的，可以先跑 smoke：
+正式跑大训练前，建议先确认链路是通的：
 
 ```bash
 prepare_nyc --config configs/smoke.toml --input data/raw/yellow_tripdata_2026-01.parquet --output data/processed/smoke_real
 train --config configs/smoke.toml --data-dir data/processed/smoke_real --output-dir outputs/smoke_real_run
 ```
 
-这条路径适合：
+Smoke 主要用于：
 
-- 验证安装是否成功
+- 验证环境安装
 - 验证 CLI 是否可用
 - 验证 trainer / evaluation / checkpoint 是否工作
 
-## 8. 常规训练步骤
+## 8. 正式训练单模型强泛化版本
 
-### 8.1 预处理
-
-```bash
-prepare_nyc --config configs/real_nyc_2026.toml --input data/raw/yellow_tripdata_2026-01.parquet --output data/processed/nyc_real_2026
-```
-
-### 8.2 训练
+### 8.1 数据预处理
 
 ```bash
-train --config configs/real_nyc_2026.toml --data-dir data/processed/nyc_real_2026 --output-dir outputs/comet_v2_run
+prepare_nyc --config configs/formal_generalist.toml --input data/raw --output data/processed/nyc_formal_q1
 ```
 
-训练输出目录示例：
+### 8.2 正式训练
 
 ```bash
-outputs/comet_v2_run
+train --config configs/formal_generalist.toml --data-dir data/processed/nyc_formal_q1 --output-dir outputs/formal_generalist_run
 ```
 
-其中通常会包含：
+正式训练配置的核心目标是：
 
-- `metrics.csv`
-- `reward_curve.csv`
-- `reward_curve.png`
-- `offline_dataset.npz`
-- `checkpoints/episode_XXXX.pt`
-- `config_snapshot.json`
+- 用一个共享策略覆盖 `8 ~ 64` 个真实智能体
+- 训练时随机化智能体数量
+- 随机化需求强度、行程时延、充电价格、充电容量、事件冲击
+- 得到一个适配多数量、多环境的单模型 checkpoint
 
-## 9. 常规评估步骤
+### 8.3 断点续训
 
-假设最新 checkpoint 是 `outputs/comet_v2_run/checkpoints/episode_0080.pt`：
+训练中断后，可以从 `latest.pt` 继续：
 
 ```bash
-evaluate --config configs/real_nyc_2026.toml --data-dir data/processed/nyc_real_2026 --checkpoint outputs/comet_v2_run/checkpoints/episode_0080.pt --output-dir outputs/eval_standard --split test --episodes 1
+train --config configs/formal_generalist.toml --data-dir data/processed/nyc_formal_q1 --output-dir outputs/formal_generalist_run --resume-checkpoint outputs/formal_generalist_run/checkpoints/latest.pt
 ```
 
-评估输出目录示例：
+当前 checkpoint 会保存并恢复：
+
+- actor / critic / cost critics
+- optimizers
+- normalizer
+- constraint multipliers
+- offline-to-online scheduler state
+- best validation reward
+- 已累计 wall clock 时间
+
+## 9. 常规评估
+
+如果你想先看标准 test split 上的效果：
 
 ```bash
-outputs/eval_standard
+evaluate --config configs/formal_generalist.toml --data-dir data/processed/nyc_formal_q1 --checkpoint outputs/formal_generalist_run/checkpoints/best_val.pt --output-dir outputs/formal_generalist_eval --split test --episodes 2
 ```
 
-通常包含：
+输出目录示例：
 
-- `metrics.csv`
-- `episode_summaries.csv`
+- `outputs/formal_generalist_eval/metrics.csv`
+- `outputs/formal_generalist_eval/episode_summaries.csv`
 
-## 10. `10训15测` 实验步骤
+## 10. 泛化评测：多数量、多环境
 
-这条实验的目标是：
+当前项目不再把 `10训15测` 作为主文档主线，而是默认支持 **单模型多数量、多环境** 泛化评测。
 
-- 训练时固定 `10` 个真实智能体
-- 测试 stress 场景里使用 `15` 个真实智能体
-- 观察策略是否还能在更大 agent 数环境中保持有效性
+推荐使用：
 
-### 10.1 预处理
+- `configs/generalization_eval.toml`
+
+### 10.1 运行 stress / generalization evaluation
 
 ```bash
-prepare_nyc --config configs/ten_to_fifteen_real.toml --input data/raw/yellow_tripdata_2026-01.parquet --output data/processed/ten15_real
+evaluate --config configs/generalization_eval.toml --data-dir data/processed/nyc_formal_q1 --checkpoint outputs/formal_generalist_run/checkpoints/best_val.pt --output-dir outputs/formal_generalist_eval --split test --episodes 2 --stress
 ```
 
-### 10.2 训练
+### 10.2 默认评测矩阵
 
-```bash
-train --config configs/ten_to_fifteen_real.toml --data-dir data/processed/ten15_real --output-dir outputs/ten15_real
-```
+智能体数量：
 
-### 10.3 Stress 评估
+- `8`
+- `16`
+- `24`
+- `32`
+- `48`
+- `64`
 
-把 checkpoint 文件名换成你实际训练出来的最新文件，例如：
+环境场景：
 
-```bash
-evaluate --config configs/ten_to_fifteen_real.toml --data-dir data/processed/ten15_real --checkpoint outputs/ten15_real/checkpoints/episode_0040.pt --output-dir outputs/ten15_eval --split test --episodes 1 --stress
-```
+- `standard_test`
+- `demand_shock_1.25`
+- `demand_shock_1.50`
+- `charger_outage_0.25`
+- `charger_outage_0.50`
+- `travel_time_1.15`
+- `travel_time_1.30`
+- `mixed_ood_stress`
 
-### 10.4 如何确认 `15` 智能体场景真的跑了
+还会额外生成对应的 `unseen_fleet_*` 场景，例如：
 
-查看：
+- `unseen_fleet_8`
+- `unseen_fleet_16`
+- `unseen_fleet_24`
+- `unseen_fleet_32`
+- `unseen_fleet_48`
+- `unseen_fleet_64`
+
+### 10.3 如何查看结果
+
+直接查看：
 
 ```bash
 python - <<'PY'
 import pandas as pd
-frame = pd.read_csv('outputs/ten15_eval/metrics.csv')
-print(frame[['scenario', 'mean_team_reward', 'order_completion_rate']])
+frame = pd.read_csv('outputs/formal_generalist_eval/metrics.csv')
+print(frame[['scenario', 'mean_team_reward', 'order_completion_rate', 'fallback_rate', 'uncertainty_trigger_rate']])
 PY
 ```
 
-你应该能在 `scenario` 列中看到：
+## 11. Greedy Baseline
 
-```text
-unseen_fleet_15
-```
-
-## 11. Stress 评估步骤
-
-如果你想做更全面的鲁棒性评估，可以直接跑 stress preset：
+如果你想和启发式基线比较：
 
 ```bash
-evaluate --config configs/stress_eval.toml --data-dir data/processed/nyc_real_2026 --checkpoint outputs/comet_v2_run/checkpoints/episode_0080.pt --output-dir outputs/eval_stress --split test --episodes 1 --stress
+run_greedy_baseline --config configs/generalization_eval.toml --data-dir data/processed/nyc_formal_q1 --output-dir outputs/greedy_generalization_eval --split test --episodes 2 --stress
 ```
 
-`metrics.csv` 中至少会包含：
+## 12. 可视化
 
-- `mean_team_reward`
-- `order_completion_rate`
-- `average_profit_per_vehicle`
-- `battery_violation_rate`
-- `charger_overflow_rate`
-- `service_violation_rate`
-- `fallback_rate`
-- `uncertainty_trigger_rate`
-- `scenario`
-
-典型 `scenario` 包括：
-
-- `standard_test`
-- `unseen_fleet_15` 或其他 unseen fleet size
-- `charger_outage_xx`
-- `demand_shock_xx`
-- `travel_time_xx`
-- `mixed_ood_stress`
-
-## 12. Greedy Baseline
-
-运行启发式基线：
+如果你已经有训练目录和评估目录：
 
 ```bash
-run_greedy_baseline --config configs/real_nyc_2026.toml --data-dir data/processed/nyc_real_2026 --output-dir outputs/greedy_eval --split test --episodes 1
+visualize_results --train-dir outputs/formal_generalist_run --eval-dirs outputs/formal_generalist_eval outputs/greedy_generalization_eval --labels COMET-v2-Generalist Greedy --output-dir outputs/formal_generalist_viz
 ```
 
-运行 `10训15测` 下的 greedy stress baseline：
-
-```bash
-run_greedy_baseline --config configs/ten_to_fifteen_real.toml --data-dir data/processed/ten15_real --output-dir outputs/ten15_greedy --split test --episodes 1 --stress
-```
-
-## 13. 可视化命令
-
-如果你已经有训练目录和评估目录，可以执行：
-
-```bash
-visualize_results --train-dir outputs/comet_v2_run --eval-dirs outputs/eval_standard outputs/eval_stress outputs/greedy_eval --labels COMET-v2 Stress Greedy --output-dir outputs/viz
-```
-
-通常会生成：
+常见输出：
 
 - `training_dashboard.png`
 - `loss_dashboard.png`
@@ -441,30 +418,53 @@ visualize_results --train-dir outputs/comet_v2_run --eval-dirs outputs/eval_stan
 - `fallback_dashboard.png`
 - `comparison_metrics.csv`
 
-## 14. 结果文件在哪里看
+## 13. 结果文件在哪里看
 
-推荐重点看这些文件：
+正式训练建议优先看这些文件：
 
-- 训练指标：`outputs/comet_v2_run/metrics.csv`
-- 训练曲线：`outputs/comet_v2_run/reward_curve.png`
-- checkpoint：`outputs/comet_v2_run/checkpoints/*.pt`
-- 标准评估：`outputs/eval_standard/metrics.csv`
-- stress 评估：`outputs/eval_stress/metrics.csv`
-- `10训15测`：`outputs/ten15_eval/metrics.csv`
-- 可视化：`outputs/viz/*.png`
+- `outputs/formal_generalist_run/metrics.csv`
+- `outputs/formal_generalist_run/reward_curve.csv`
+- `outputs/formal_generalist_run/reward_curve.png`
+- `outputs/formal_generalist_run/checkpoints/latest.pt`
+- `outputs/formal_generalist_run/checkpoints/best_val.pt`
+- `outputs/formal_generalist_eval/metrics.csv`
+- `outputs/formal_generalist_eval/episode_summaries.csv`
+- `outputs/formal_generalist_viz/comparison_metrics.csv`
 
-## 15. 常见报错排查
+训练日志里新增了这些正式训练字段：
 
-### 15.1 `prepare_nyc: command not found`
+- `wall_clock_seconds`
+- `episodes_per_hour`
+- `steps_per_second`
+- `best_val_mean_team_reward`
+- `checkpoint_tag`
 
-说明当前环境还没有安装项目入口。执行：
+评估 `metrics.csv` 至少包含：
+
+- `mean_team_reward`
+- `order_completion_rate`
+- `average_profit_per_vehicle`
+- `battery_violation_rate`
+- `charger_overflow_rate`
+- `service_violation_rate`
+- `fallback_rate`
+- `uncertainty_trigger_rate`
+- `scenario`
+- `data_window`
+- `model_variant`
+
+## 14. 常见报错排查
+
+### 14.1 `prepare_nyc: command not found`
+
+说明当前环境还没有安装项目 CLI。执行：
 
 ```bash
 python -m pip install -e .
 which prepare_nyc
 ```
 
-### 15.2 `train: command not found` 或 `evaluate: command not found`
+### 14.2 `train: command not found` 或 `evaluate: command not found`
 
 同样先执行：
 
@@ -474,29 +474,29 @@ which train
 which evaluate
 ```
 
-### 15.3 `torch.cuda.is_available() = False`
+### 14.3 `torch.cuda.is_available() = False`
 
-说明当前虚拟环境里装的可能不是 CUDA 版 PyTorch，或者服务器没有正确暴露 GPU。请先检查：
+请检查：
 
 ```bash
 nvidia-smi
 python -c "import torch; print(torch.cuda.is_available())"
 ```
 
-必要时重新安装 CUDA 版 torch。
+必要时重新安装 CUDA 版 PyTorch。
 
-### 15.4 `TOMLDecodeError` / 配置读取失败
+### 14.4 `TOMLDecodeError`
 
-如果你手工编辑过 `.toml`，请确认文件是有效 TOML，且没有混入奇怪字符。
+说明配置文件格式损坏，通常是手工编辑 `.toml` 时引入了非法字符。请优先恢复到仓库内现有配置模板。
 
-### 15.5 `which prepare_nyc` 没有输出
+### 14.5 `which prepare_nyc` 没有输出
 
-这通常表示：
+通常表示：
 
 - 没激活 `.venv`
-- 或者没执行 `pip install -e .`
+- 或没有执行 `pip install -e .`
 
-按下面顺序重试：
+按这个顺序重试：
 
 ```bash
 source .venv/bin/activate
@@ -504,14 +504,24 @@ python -m pip install -e .
 which prepare_nyc
 ```
 
-## 16. 当前简化点 / 已知局限
+### 14.6 预处理报“目录下没有找到 `yellow_tripdata_*.parquet`”
 
-当前实现已经可以运行真实 TLC 驱动的 COMET-v2 原型，但仍有一些工程上的简化：
+请确认原始数据真的放在：
 
-- TLC 数据没有真实电价，因此充电价格使用 **time-of-day proxy**。
-- reposition 动作不是基于真实道路网络，而是基于 **历史 OD 转移构造的四邻域 zone graph**。
-- 环境中的充电站仍是 **zone-level 近似**，不是精确站点拓扑。
-- offline dataset 仍是由 simulator + behavior policy 导出的初始离线数据，不是真实车队日志。
-- planner 采用的是轻量候选动作打分器，不是完整 MPC。
+- `data/raw/yellow_tripdata_2025-12.parquet`
+- `data/raw/yellow_tripdata_2026-01.parquet`
+- `data/raw/yellow_tripdata_2026-02.parquet`
 
-不过这些简化都已经在代码结构上留好了继续增强的接口，适合作为导师汇报版本和后续论文 / 项目迭代基础。
+并且 `--input` 指向的是 `data/raw` 目录本身，而不是空目录。
+
+## 15. 当前简化点 / 已知局限
+
+当前版本已经可以正式训练和泛化评测，但仍保留一些工程上的最小可运行近似：
+
+- TLC 数据没有真实电价字段，因此充电价格仍使用 time-of-day proxy。
+- reposition 不是基于真实路网，而是基于历史 OD 转移构造 zone 邻接图。
+- 充电站仍是 zone-level 近似，不是真实站点拓扑。
+- offline dataset 仍来自 simulator + behavior policy，而不是真实车队日志。
+- planner 目前是轻量候选动作打分器，不是完整 MPC。
+
+这些简化不会影响当前“单模型强泛化正式训练 + 多数量多环境评测”的主链路，但后续还可以继续往更真实的电价、站点图和道路网络上增强。

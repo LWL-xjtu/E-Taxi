@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +39,7 @@ class CometTrainer:
         config: ExperimentConfig,
         dataset_root: str | Path,
         output_dir: str | Path,
+        resume_checkpoint: str | Path | None = None,
     ) -> None:
         self.config = config
         self.dataset = PreparedDataset.load(dataset_root)
@@ -76,7 +79,12 @@ class CometTrainer:
         self.planner = CandidatePlanner(config)
         self.constraint_multipliers = {name: config.safety.multiplier_init for name in COST_NAMES}
         self.scheduler_state = {"step": 0}
+        self.start_episode = 1
+        self.best_val_mean_team_reward = float("-inf")
+        self.resume_wall_clock_seconds = 0.0
         seed_everything(config.train.seed)
+        if resume_checkpoint is not None:
+            self.load_checkpoint(resume_checkpoint)
 
     def _slice_replay_batch(self, batch: ReplayBatch, indices: np.ndarray) -> ReplayBatch:
         return ReplayBatch(
@@ -112,9 +120,41 @@ class CometTrainer:
             "normalizer_state_dict": self.normalizer.state_dict() if self.normalizer is not None else None,
             "constraint_multipliers": self.constraint_multipliers,
             "scheduler_state": self.scheduler_state,
+            "best_val_mean_team_reward": self.best_val_mean_team_reward,
+            "resume_wall_clock_seconds": self.resume_wall_clock_seconds,
         }
         torch.save(checkpoint, checkpoint_path)
+        torch.save(checkpoint, self.checkpoint_dir / "latest.pt")
         return checkpoint_path
+
+    def _save_best_checkpoint(self, episode: int) -> None:
+        checkpoint_path = self.checkpoint_dir / f"episode_{episode:04d}.pt"
+        best_path = self.checkpoint_dir / "best_val.pt"
+        if checkpoint_path.exists():
+            shutil.copy2(checkpoint_path, best_path)
+
+    def load_checkpoint(self, checkpoint_path: str | Path) -> None:
+        checkpoint = torch.load(Path(checkpoint_path), map_location=self.device)
+        self.actor.load_state_dict(checkpoint["actor_state_dict"])
+        self.critic.load_state_dict(checkpoint["critic_state_dict"])
+        if self.cost_critic is not None and checkpoint.get("cost_critic_state_dict"):
+            self.cost_critic.load_state_dict(checkpoint["cost_critic_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if self.normalizer is not None and checkpoint.get("normalizer_state_dict"):
+            self.normalizer.load_state_dict(checkpoint["normalizer_state_dict"])
+        self.constraint_multipliers.update(checkpoint.get("constraint_multipliers", {}))
+        self.scheduler_state.update(checkpoint.get("scheduler_state", {}))
+        self.best_val_mean_team_reward = float(
+            checkpoint.get("best_val_mean_team_reward", self.best_val_mean_team_reward)
+        )
+        self.resume_wall_clock_seconds = float(
+            checkpoint.get("resume_wall_clock_seconds", self.resume_wall_clock_seconds)
+        )
+        self.start_episode = int(checkpoint.get("episode", 0)) + 1
+        metrics_path = self.output_dir / "metrics.csv"
+        if metrics_path.exists():
+            existing = pd.read_csv(metrics_path)
+            self.history = existing.to_dict("records")
 
     def _offline_ratio(self) -> float:
         decay_steps = max(self.config.online_finetune.offline_ratio_decay_steps, 1)
@@ -487,8 +527,10 @@ class CometTrainer:
     def train(self) -> pd.DataFrame:
         config_path = self.output_dir / "config_snapshot.json"
         config_path.write_text(json.dumps(self.config.to_dict(), indent=2), encoding="utf-8")
-        offline_metrics = self._offline_pretrain()
-        self.history.append({"episode": 0, **offline_metrics})
+        train_start = time.perf_counter()
+        if self.start_episode == 1 and not self.history:
+            offline_metrics = self._offline_pretrain()
+            self.history.append({"episode": 0, **offline_metrics})
 
         def _eval_actions(observation: dict[str, Any]) -> Any:
             actions, _, planner_info = action_selection_from_policy(
@@ -509,12 +551,16 @@ class CometTrainer:
             )
             return actions
 
-        for episode in range(1, self.config.train.total_episodes + 1):
+        cumulative_env_steps = 0
+        for episode in range(self.start_episode, self.config.train.total_episodes + 1):
             batch, info = self._run_rollout()
+            cumulative_env_steps += int(batch.returns.shape[0])
             losses = self._update_online(batch)
             mixed_losses = self._mixed_replay_update()
             self._update_multipliers(batch)
             self.scheduler_state["step"] += 1
+            elapsed = self.resume_wall_clock_seconds + (time.perf_counter() - train_start)
+            hours = max(elapsed / 3600.0, 1e-6)
             record: dict[str, float | int] = {
                 "episode": episode,
                 "train_mean_team_reward": float(info["mean_team_reward"]),
@@ -528,21 +574,45 @@ class CometTrainer:
                 "lambda_battery": self.constraint_multipliers["battery_violation_cost"],
                 "lambda_charger": self.constraint_multipliers["charger_overflow_cost"],
                 "lambda_service": self.constraint_multipliers["service_violation_cost"],
+                "wall_clock_seconds": elapsed,
+                "episodes_per_hour": float(max(episode - self.start_episode + 1, 1) / hours),
+                "steps_per_second": float(cumulative_env_steps / max(elapsed, 1e-6)),
+                "best_val_mean_team_reward": self.best_val_mean_team_reward,
+                "checkpoint_tag": "none",
                 **losses,
                 **mixed_losses,
             }
 
             if episode % self.config.train.eval_interval == 0:
                 metrics_frame, _ = evaluate_policy(self.env, _eval_actions, "val", episodes=1)
+                eval_mean_team_reward = None
                 for key, value in metrics_frame.iloc[0].to_dict().items():
                     if key in {"split", "episodes", "scenario"}:
                         continue
                     record[f"eval_{key}"] = float(value)
+                    if key == "mean_team_reward":
+                        eval_mean_team_reward = float(value)
+                if eval_mean_team_reward is not None and eval_mean_team_reward > self.best_val_mean_team_reward:
+                    self.best_val_mean_team_reward = eval_mean_team_reward
+                    record["best_val_mean_team_reward"] = self.best_val_mean_team_reward
+                    record["checkpoint_tag"] = "best_pending"
 
             self.history.append(record)
 
+            checkpoint_tag = "none"
             if episode % self.config.train.save_interval == 0 or episode == self.config.train.total_episodes:
                 self._save_checkpoint(episode)
+                checkpoint_tag = "periodic+latest"
+                if record["checkpoint_tag"] == "best_pending":
+                    self._save_best_checkpoint(episode)
+                    checkpoint_tag = "best+periodic+latest"
+            elif record["checkpoint_tag"] == "best_pending":
+                self._save_checkpoint(episode)
+                self._save_best_checkpoint(episode)
+                checkpoint_tag = "best+latest"
+            record["best_val_mean_team_reward"] = self.best_val_mean_team_reward
+            record["checkpoint_tag"] = checkpoint_tag
+            self.resume_wall_clock_seconds = elapsed
 
         history_frame = pd.DataFrame(self.history)
         history_frame.to_csv(self.output_dir / "metrics.csv", index=False)

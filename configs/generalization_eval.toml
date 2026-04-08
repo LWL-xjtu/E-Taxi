@@ -1,0 +1,153 @@
+[data]
+grid_rows = 8
+grid_cols = 8
+zone_mode = "tlc_location_id"
+zone_count_override = 263
+step_minutes = 10
+start_hour = 0
+end_hour = 24
+use_first_n_days = 90
+train_days = 70
+val_days = 10
+test_days = 10
+
+[env]
+nmax = 64
+min_active_agents = 8
+max_active_agents = 64
+charge_station_count = 5
+charger_capacity = 4
+max_queue_length = 8
+battery_low_threshold = 0.25
+battery_mid_threshold = 0.60
+default_charge_price = 1.0
+battery_capacity_kwh = 60.0
+battery_min_kwh = 5.0
+init_battery_min_ratio = 0.40
+init_battery_max_ratio = 1.00
+energy_per_km = 0.15
+charge_power_kw = 50.0
+reposition_distance_km = 2.0
+death_penalty = 25.0
+low_battery_penalty_weight = 0.35
+empty_move_penalty = 0.08
+idle_penalty = 0.02
+service_violation_penalty = 0.05
+
+[model]
+variant = "v2"
+zone_embedding_dim = 24
+hidden_dim = 192
+fleet_hidden_dim = 192
+dropout = 0.1
+aux_hidden_dim = 96
+critic_ensemble_size = 3
+vehicle_token_dim = 192
+use_layer_norm = true
+
+[set_encoder]
+type = "set_transformer"
+hidden_dim = 192
+num_heads = 4
+num_inducing_points = 8
+pooling = "mean"
+use_fleet_signature_skip = true
+
+[temporal]
+history_len = 8
+encoder_type = "gru"
+hidden_dim = 128
+num_layers = 1
+
+[train]
+seed = 17
+device = "auto"
+total_episodes = 1
+rollout_episodes_per_update = 1
+ppo_epochs = 1
+minibatch_size = 8
+gamma = 0.99
+gae_lambda = 0.95
+ppo_clip = 0.2
+entropy_coef = 0.01
+value_coef = 0.5
+aux_coef = 0.2
+cost_value_coef = 0.3
+learning_rate = 0.00025
+weight_decay = 0.00001
+max_grad_norm = 0.8
+eval_interval = 1
+save_interval = 1
+
+[domain_randomization]
+enabled = false
+demand_scale_min = 1.0
+demand_scale_max = 1.0
+travel_time_noise_min = 1.0
+travel_time_noise_max = 1.0
+charge_price_scale_min = 1.0
+charge_price_scale_max = 1.0
+charger_capacity_scale_min = 1.0
+charger_capacity_scale_max = 1.0
+peak_shock_probability = 0.0
+peak_shock_scale_min = 1.0
+peak_shock_scale_max = 1.0
+event_day_probability = 0.0
+event_day_scale_min = 1.0
+event_day_scale_max = 1.0
+apply_to_eval = true
+
+[reward]
+profit_weight = 1.0
+efficiency_weight = 1.0
+battery_weight = 1.0
+
+[offline_rl]
+enabled = false
+algorithm = "iql"
+dataset_episodes = 2
+pretrain_epochs = 1
+batch_size = 8
+expectile = 0.7
+temperature = 1.5
+cql_alpha = 0.1
+awac_lambda = 1.0
+
+[online_finetune]
+offline_ratio_start = 0.0
+offline_ratio_end = 0.0
+offline_ratio_decay_steps = 1
+planner_enabled = true
+uncertainty_threshold = 0.22
+online_replay_capacity = 128
+
+[safety]
+battery_limit = 0.05
+charger_limit = 0.10
+service_limit = 0.25
+multiplier_init = 0.1
+multiplier_lr = 0.05
+pid_kp = 1.0
+pid_ki = 0.1
+pid_kd = 0.0
+
+[planner]
+top_k_zones = 4
+use_value_scoring = true
+use_short_horizon_rollout = false
+fallback_policy = "greedy"
+risk_trigger_soc = 0.18
+planner_mode = "planner"
+actor_prior_weight = 1.0
+value_weight = 0.15
+cost_penalty_weight = 0.6
+uncertainty_penalty_weight = 0.3
+
+[evaluation]
+standard_episodes = 2
+stress_episodes = 2
+unseen_fleet_sizes = [8, 16, 24, 32, 48, 64]
+charger_outage_levels = [0.25, 0.50]
+demand_shock_levels = [1.25, 1.50]
+travel_time_shock_levels = [1.15, 1.30]
+event_day_presets = ["baseline", "concert", "rain"]

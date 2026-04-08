@@ -102,6 +102,32 @@ def _pick_first_existing(columns: list[str], frame: pd.DataFrame) -> str:
     )
 
 
+def _resolve_input_paths(input_path: str | Path) -> list[Path]:
+    source = Path(input_path)
+    if source.is_file():
+        return [source]
+    if source.is_dir():
+        candidates = sorted(source.glob("yellow_tripdata_*.parquet"))
+        if not candidates:
+            raise ValueError(
+                f"No yellow_tripdata_*.parquet files were found under directory: {source}"
+            )
+        return candidates
+    raise ValueError(f"Input path does not exist or is not supported: {source}")
+
+
+def _extract_source_months(paths: list[Path]) -> list[str]:
+    months: list[str] = []
+    for path in paths:
+        stem = path.stem
+        marker = "yellow_tripdata_"
+        if marker in stem:
+            months.append(stem.split(marker, 1)[1])
+        else:
+            months.append(stem)
+    return months
+
+
 def _build_charge_price_proxy(time_bin_index: pd.Series) -> np.ndarray:
     fraction = time_bin_index.to_numpy(dtype=np.float32) / 144.0
     morning_peak = ((time_bin_index >= 42) & (time_bin_index <= 60)).to_numpy(dtype=np.float32)
@@ -314,6 +340,7 @@ def _build_metadata(
     config: DataConfig,
     mapping_metadata: dict[str, Any],
     charge_station_count: int,
+    source_files: list[Path],
 ) -> dict[str, Any]:
     train_frame = split_frames["train"]
     cell_count = int(config.cell_count if config.zone_mode == "grid" else MAX_TLC_LOCATION_ID)
@@ -374,6 +401,16 @@ def _build_metadata(
         "std_revenue_amount": float(processed["revenue_amount"].std(ddof=0) or 0.0),
     }
     mapping_metadata["zone_neighbors"] = zone_neighbors
+    source_months = _extract_source_months(source_files)
+    available_days = sorted(processed["service_date"].unique().tolist())
+    split_day_counts = {split: len(days) for split, days in split_dates.items()}
+    split_date_ranges = {
+        split: {
+            "start": days[0] if days else None,
+            "end": days[-1] if days else None,
+        }
+        for split, days in split_dates.items()
+    }
     return {
         "data": {
             "zone_mode": mapping_metadata.get("zone_mode", config.zone_mode),
@@ -386,6 +423,11 @@ def _build_metadata(
             "episode_steps": config.episode_steps,
             "time_bins_per_day": config.time_bins_per_day,
         },
+        "source_files": [str(path) for path in source_files],
+        "source_months": source_months,
+        "available_days": available_days,
+        "split_day_counts": split_day_counts,
+        "split_date_ranges": split_date_ranges,
         "splits": split_dates,
         "charge_stations": charge_stations,
         "zone_demand_priors": demand_priors.tolist(),
@@ -425,7 +467,11 @@ def prepare_nyc_dataset(
     config: DataConfig,
     charge_station_count: int = 5,
 ) -> PreparedDataset:
-    source = pd.read_parquet(input_path)
+    source_files = _resolve_input_paths(input_path)
+    source = pd.concat(
+        [pd.read_parquet(path) for path in source_files],
+        ignore_index=True,
+    )
     processed, mapping_metadata = _canonicalize_orders(source, config)
 
     selected_days = sorted(processed["service_date"].unique())
@@ -457,6 +503,7 @@ def prepare_nyc_dataset(
         config,
         mapping_metadata,
         charge_station_count=charge_station_count,
+        source_files=source_files,
     )
     dump_json(metadata, dataset_root / "metadata.json")
     return PreparedDataset(root=dataset_root, metadata=metadata, splits=split_frames)

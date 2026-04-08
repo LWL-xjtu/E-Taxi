@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 
 from comet_taxi.config import load_experiment_config
@@ -10,7 +11,11 @@ from comet_taxi.synthetic import write_synthetic_parquet
 
 
 def test_stress_eval_pipeline_writes_expected_columns(tmp_path: Path) -> None:
-    config = load_experiment_config("configs/smoke.toml")
+    config = deepcopy(load_experiment_config("configs/generalization_eval.toml"))
+    config.data.use_first_n_days = 7
+    config.data.train_days = 5
+    config.data.val_days = 1
+    config.data.test_days = 1
     parquet_path = tmp_path / "synthetic.parquet"
     data_dir = tmp_path / "prepared"
     output_dir = tmp_path / "eval"
@@ -33,12 +38,18 @@ def test_stress_eval_pipeline_writes_expected_columns(tmp_path: Path) -> None:
         "service_violation_rate",
         "fallback_rate",
         "uncertainty_trigger_rate",
+        "data_window",
+        "model_variant",
     ):
         assert column in metrics.columns
 
 
-def test_ten_to_fifteen_config_exposes_unseen_fleet_15(tmp_path: Path) -> None:
-    config = load_experiment_config("configs/ten_to_fifteen_real.toml")
+def test_generalization_eval_config_exposes_full_scenario_matrix(tmp_path: Path) -> None:
+    config = deepcopy(load_experiment_config("configs/generalization_eval.toml"))
+    config.data.use_first_n_days = 7
+    config.data.train_days = 5
+    config.data.val_days = 1
+    config.data.test_days = 1
     parquet_path = tmp_path / "synthetic.parquet"
     data_dir = tmp_path / "prepared"
     output_dir = tmp_path / "eval"
@@ -52,4 +63,21 @@ def test_ten_to_fifteen_config_exposes_unseen_fleet_15(tmp_path: Path) -> None:
     dataset = PreparedDataset.load(data_dir)
     env = CometTaxiEnv(dataset, config, seed=config.train.seed)
     metrics = evaluate_greedy(config, env, output_dir, split="test", episodes=1, stress=True)
-    assert "unseen_fleet_15" in set(metrics["scenario"].tolist())
+    scenarios = set(metrics["scenario"].tolist())
+    expected = {
+        "standard_test",
+        "unseen_fleet_8",
+        "unseen_fleet_16",
+        "unseen_fleet_24",
+        "unseen_fleet_32",
+        "unseen_fleet_48",
+        "unseen_fleet_64",
+        "charger_outage_0.25",
+        "charger_outage_0.50",
+        "demand_shock_1.25",
+        "demand_shock_1.50",
+        "travel_time_1.15",
+        "travel_time_1.30",
+        "mixed_ood_stress",
+    }
+    assert expected.issubset(scenarios)

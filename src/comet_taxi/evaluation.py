@@ -59,6 +59,13 @@ def evaluate_policy(
     return metrics_frame, summary_frame
 
 
+def _data_window_label(env: CometTaxiEnv) -> str:
+    months = env.dataset.metadata.get("source_months", [])
+    if months:
+        return ",".join(str(month) for month in months)
+    return "unknown"
+
+
 def build_stress_scenarios(config: ExperimentConfig) -> list[tuple[str, dict[str, float]]]:
     scenarios: list[tuple[str, dict[str, float]]] = [("standard_test", {})]
     for fleet_size in config.evaluation.unseen_fleet_sizes:
@@ -149,6 +156,8 @@ def evaluate_checkpoint(
         summary_frames.append(summary_frame)
     metrics_frame = pd.concat(metrics_frames, ignore_index=True)
     summary_frame = pd.concat(summary_frames, ignore_index=True)
+    metrics_frame["data_window"] = _data_window_label(env)
+    metrics_frame["model_variant"] = config.model.variant
     output_root = ensure_dir(output_dir)
     metrics_frame.to_csv(output_root / "metrics.csv", index=False)
     summary_frame.to_csv(output_root / "episode_summaries.csv", index=False)
@@ -180,6 +189,8 @@ def evaluate_greedy(
         summary_frames.append(summary_frame)
     metrics_frame = pd.concat(metrics_frames, ignore_index=True)
     summary_frame = pd.concat(summary_frames, ignore_index=True)
+    metrics_frame["data_window"] = _data_window_label(env)
+    metrics_frame["model_variant"] = "greedy"
     output_root = ensure_dir(output_dir)
     metrics_frame.to_csv(output_root / "metrics.csv", index=False)
     summary_frame.to_csv(output_root / "episode_summaries.csv", index=False)

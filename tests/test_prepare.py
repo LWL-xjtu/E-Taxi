@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 
 from comet_taxi.config import load_experiment_config
@@ -53,3 +54,48 @@ def test_prepare_nyc_dataset_outputs_expected_files(tmp_path: Path) -> None:
     stats = fit_normalization_statistics(dataset)
     assert "charge_price_mean" in stats
     assert "trip_distance_km_mean" in stats
+
+
+def test_prepare_nyc_dataset_accepts_directory_and_writes_formal_metadata(tmp_path: Path) -> None:
+    config = deepcopy(load_experiment_config("configs/formal_generalist.toml"))
+    raw_dir = tmp_path / "raw"
+    output_dir = tmp_path / "prepared"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    write_synthetic_parquet(
+        raw_dir / "yellow_tripdata_2025-12.parquet",
+        start="2025-12-01 00:00:00",
+        days=31,
+        rows_per_step=1,
+    )
+    write_synthetic_parquet(
+        raw_dir / "yellow_tripdata_2026-01.parquet",
+        start="2026-01-01 00:00:00",
+        days=31,
+        rows_per_step=1,
+    )
+    write_synthetic_parquet(
+        raw_dir / "yellow_tripdata_2026-02.parquet",
+        start="2026-02-01 00:00:00",
+        days=28,
+        rows_per_step=1,
+    )
+
+    dataset = prepare_nyc_dataset(
+        raw_dir,
+        output_dir,
+        config.data,
+        charge_station_count=config.env.charge_station_count,
+    )
+
+    metadata = dataset.metadata
+    assert metadata["source_months"] == ["2025-12", "2026-01", "2026-02"]
+    assert metadata["split_day_counts"] == {"train": 70, "val": 10, "test": 10}
+    assert len(metadata["available_days"]) == 90
+    assert metadata["split_date_ranges"]["train"]["start"] == "2025-12-01"
+    assert metadata["split_date_ranges"]["train"]["end"] == "2026-02-08"
+    assert metadata["split_date_ranges"]["val"]["start"] == "2026-02-09"
+    assert metadata["split_date_ranges"]["val"]["end"] == "2026-02-18"
+    assert metadata["split_date_ranges"]["test"]["start"] == "2026-02-19"
+    assert metadata["split_date_ranges"]["test"]["end"] == "2026-02-28"
+    assert len(metadata["source_files"]) == 3
